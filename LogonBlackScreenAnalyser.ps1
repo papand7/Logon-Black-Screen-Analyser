@@ -23,12 +23,19 @@
       -InstallProbe [-SharePath \\srv\share] [-ReportShortcut] / -UninstallProbe
                                       Logon probe (measures sign-in to taskbar for every logon) and the
                                       "Report slow sign-in" desktop shortcut. Elevated.
+      -InstallModules                 Install the missing PowerShell modules for the Azure features from the
+                                      PowerShell Gallery (all users when elevated, otherwise current user).
 
     Scanning only reads the system. Changes are made only by one-click fixes in the GUI (after a confirmation that
     shows what changes and the impact), by -InstallProbe / -UninstallProbe, or by the exported Intune scripts.
     Registry fixes are backed up first and can be undone in the Fix history tab.
 
-    Data: C:\ProgramData\LogonBlackScreenAnalyzer (history, fix log, backups, probe data, reports, config.json).
+    Settings: LogonBlackScreenAnalyser.settings.json next to this script (share path, webhook, workspace, host pool).
+    Data: C:\ProgramData\LogonBlackScreenAnalyzer (history, fix log, backups, probe data, reports; config.json there
+    is the copy of the share path / webhook used by the probe and report scripts on that host).
+
+    Azure and Microsoft Graph features run in a separate PowerShell window, where you sign in when asked; the
+    analyser window stays responsive.
     Known Windows update issues are built in; a KnownIssues.json next to this file overrides them
     (Tools > Settings > Open / create KnownIssues.json).
 
@@ -75,12 +82,13 @@ param(
     [string]$ExportIntune,
     [switch]$InstallProbe,
     [switch]$UninstallProbe,
+    [switch]$InstallModules,
     [string]$SharePath,
     [switch]$ReportShortcut,
     [string]$KnownIssuesPath
 )
 
-$cliMode = $NoGui -or $Gate -or $ComputerName -or $SaveBaseline -or $CompareBaseline -or $SupportBundle -or $ExportIntune -or $InstallProbe -or $UninstallProbe
+$cliMode = $NoGui -or $Gate -or $ComputerName -or $SaveBaseline -or $CompareBaseline -or $SupportBundle -or $ExportIntune -or $InstallProbe -or $UninstallProbe -or $InstallModules
 
 #region Relaunch in Windows PowerShell 5.1 / STA when needed
 $needsRelaunch = ($PSVersionTable.PSEdition -eq 'Core') -or (-not $cliMode -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA')
@@ -222,7 +230,23 @@ function New-AutoFix {
 
 function Format-Steps   { param([object[]]$Steps) $i = 0; (@($Steps) | Where-Object { $_ } | ForEach-Object { $i++; "$i. $_" }) -join "`r`n" }
 function Format-Bullets { param([object[]]$Items) (@($Items) | Where-Object { $_ } | ForEach-Object { "- $_" }) -join "`r`n" }
-function Join-Lines     { param([object[]]$Lines) (@($Lines) | Where-Object { $null -ne $_ -and "$_" -ne '' }) -join "`r`n" }
+function Join-Lines {
+    # Flattens nested lists (e.g. "@('Header', ($items | ForEach-Object { ... }))") so they print as lines, not "System.Object[]"
+    param([object[]]$Lines)
+    $flat = New-Object System.Collections.Generic.List[string]
+    $stack = New-Object System.Collections.Stack
+    for ($i = @($Lines).Count - 1; $i -ge 0; $i--) { $stack.Push(@($Lines)[$i]) }
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop()
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Collections.IEnumerable] -and $item -isnot [string] -and $item -isnot [System.Collections.IDictionary]) {
+            $arr = @($item); for ($i = $arr.Count - 1; $i -ge 0; $i--) { $stack.Push($arr[$i]) }
+            continue
+        }
+        if ("$item" -ne '') { $flat.Add([string]$item) }
+    }
+    $flat -join "`r`n"
+}
 
 # PowerShell snippet (as text) that backs up a registry key before a change. Keys that do not exist
 # yet get a marker file, so an undo knows to delete the key again.
@@ -2503,25 +2527,80 @@ function Get-Percentile {
 
 function Assert-Module {
     param([string]$Name)
-    if (-not (Get-Module -ListAvailable -Name $Name)) { throw "The PowerShell module '$Name' is not installed. Install it with:  Install-Module $Name -Scope CurrentUser" }
+    if (-not (Get-Module -ListAvailable -Name $Name)) { throw "The PowerShell module '$Name' is not installed. Use 'Install missing modules' at the top of the Azure tab, or run:  Install-Module $Name -Scope CurrentUser" }
     Import-Module $Name -ErrorAction Stop
+}
+
+# PowerShell modules used by the Azure features (AVD Insights, host pool list, release health)
+$RequiredModules = @(
+    [pscustomobject]@{ Name = 'Az.Accounts';                    Purpose = 'Azure sign-in (AVD Insights, host pool list)' }
+    [pscustomobject]@{ Name = 'Az.OperationalInsights';         Purpose = 'AVD Insights queries (Log Analytics)' }
+    [pscustomobject]@{ Name = 'Az.DesktopVirtualization';       Purpose = 'Load session hosts from an AVD host pool (Fleet tab)' }
+    [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Purpose = 'Windows release health known issues (Microsoft Graph)' }
+)
+
+function Get-RequiredModuleStatus {
+    foreach ($m in $RequiredModules) {
+        $mod = Get-Module -ListAvailable -Name $m.Name -ErrorAction SilentlyContinue | Sort-Object Version -Descending | Select-Object -First 1
+        [pscustomobject]@{ Name = $m.Name; Purpose = $m.Purpose; Installed = [bool]$mod; Version = $(if ($mod) { "$($mod.Version)" } else { '' }) }
+    }
+}
+
+# Installs the missing modules from the PowerShell Gallery (existing modules are not changed)
+function Install-RequiredModules {
+    param([switch]$AllUsers)
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    $scope = if ($AllUsers) { 'AllUsers' } else { 'CurrentUser' }
+    $out = New-Object System.Collections.Generic.List[string]
+    $nuget = Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue | Where-Object { $_.Version -ge [version]'2.8.5.201' }
+    if (-not $nuget) {
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope $scope -Force -ErrorAction Stop | Out-Null
+        $out.Add('NuGet package provider installed.')
+    }
+    foreach ($m in @(Get-RequiredModuleStatus | Where-Object { -not $_.Installed })) {
+        try {
+            Install-Module -Name $m.Name -Repository PSGallery -Scope $scope -Force -AllowClobber -ErrorAction Stop
+            $v = (Get-Module -ListAvailable -Name $m.Name | Sort-Object Version -Descending | Select-Object -First 1).Version
+            $out.Add("Installed $($m.Name) $v ($scope)")
+        } catch { $out.Add("FAILED $($m.Name): $($_.Exception.Message)") }
+    }
+    if ($out.Count -eq 0) { $out.Add('All required modules are already installed.') }
+    $out -join "`r`n"
 }
 #endregion
 
-#region Tool configuration (shared with the probe and report scripts)
+#region Tool configuration
+# The settings file lives next to the analyser (LogonBlackScreenAnalyser.settings.json, $SettingsPath).
+# The probe / report scripts on a host read a small copy (share path + webhook) from ProgramData\...\config.json,
+# written when the probe is installed or when settings are saved while the probe is installed.
+if (-not $SettingsPath) { $SettingsPath = Join-Path $ToolBase 'LogonBlackScreenAnalyser.settings.json' }
+$ProbeConfigPath = Join-Path $ToolBase 'config.json'
+
 function Get-ToolConfig {
     $cfg = [ordered]@{ SharePath = ''; WebhookUrl = ''; WorkspaceId = ''; SubscriptionId = ''; HostPoolResourceGroup = ''; HostPoolName = '' }
-    $f = Join-Path $ToolBase 'config.json'
-    if (Test-Path $f) {
+    $f = $SettingsPath
+    if (-not (Test-Path -LiteralPath $f) -and (Test-Path -LiteralPath $ProbeConfigPath)) { $f = $ProbeConfigPath }   # settings from older versions
+    if (Test-Path -LiteralPath $f) {
         try { $j = [System.IO.File]::ReadAllText($f) | ConvertFrom-Json; foreach ($p in $j.PSObject.Properties) { $cfg[$p.Name] = $p.Value } } catch { }
     }
     [pscustomobject]$cfg
 }
 
-function Save-ToolConfig {
+function Write-ProbeConfig {
     param($Config)
     New-Item -ItemType Directory -Force $ToolBase | Out-Null
-    [System.IO.File]::WriteAllText((Join-Path $ToolBase 'config.json'), ($Config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
+    $probe = [ordered]@{ SharePath = $Config.SharePath; WebhookUrl = $Config.WebhookUrl }
+    [System.IO.File]::WriteAllText($ProbeConfigPath, ($probe | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
+}
+
+# Returns a note about the probe copy (empty when the probe is not installed on this host)
+function Save-ToolConfig {
+    param($Config)
+    [System.IO.File]::WriteAllText($SettingsPath, ($Config | ConvertTo-Json), (New-Object System.Text.UTF8Encoding $false))
+    if (Test-Path (Join-Path $ToolBase 'bin\Start-LogonProbe.ps1')) {
+        try { Write-ProbeConfig $Config; 'The share path and webhook were also updated for the logon probe on this host.' }
+        catch { 'The logon probe on this host still uses the old share path / webhook - save again as administrator to update it.' }
+    }
 }
 
 function Get-ProbePaths {
@@ -2933,7 +3012,8 @@ function Install-LogonProbe {
     [System.IO.File]::WriteAllText((Join-Path $bin 'Start-LogonProbe.ps1'), $ProbeScriptText.Trim() + "`r`n", $utf8Bom)
     [System.IO.File]::WriteAllText((Join-Path $bin 'Report-SlowLogon.ps1'), $ReportScriptText.Trim() + "`r`n", $utf8Bom)
     $cfg = Get-ToolConfig
-    if ($PSBoundParameters.ContainsKey('SharePath')) { $cfg.SharePath = $SharePath; Save-ToolConfig $cfg }
+    if ($PSBoundParameters.ContainsKey('SharePath')) { $cfg.SharePath = $SharePath; try { [void](Save-ToolConfig $cfg) } catch { } }
+    Write-ProbeConfig $cfg
     $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
     $action = New-ScheduledTaskAction -Execute $ps -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$bin\Start-LogonProbe.ps1`" -Background"
     $trigger = New-ScheduledTaskTrigger -AtLogOn
@@ -3102,28 +3182,94 @@ function Export-FleetReport {
 #endregion
 
 #region Azure (AVD Insights) and Microsoft Graph (Windows release health)
+# Azure and Graph calls run in a separate, visible Windows PowerShell window ("helper"). Sign-in dialogs work
+# normally there, and the analyser window never blocks: started from inside the WPF app the Azure / Graph
+# sign-in can hang and freeze the GUI. The helper writes its result to a temp file that is read back here.
+function Assert-ModuleAvailable {
+    param([string]$Name)
+    if (-not (Get-Module -ListAvailable -Name $Name)) { throw "The PowerShell module '$Name' is not installed. Use 'Install missing modules' at the top of the Azure tab, or run:  Install-Module $Name -Scope CurrentUser" }
+}
+
+function Invoke-HelperProcess {
+    param([Parameter(Mandatory)][string]$Code, [string]$Title = 'Working', [int]$TimeoutMinutes = 15)
+    $out = Join-Path $env:TEMP ('LBS-helper-{0}.json' -f [guid]::NewGuid().ToString('N'))
+    $full = @"
+`$Host.UI.RawUI.WindowTitle = 'Logon Black Screen Analyser - $Title'
+`$ErrorActionPreference = 'Stop'
+`$result = `$null
+try {
+$Code
+    ConvertTo-Json -InputObject @(`$result) -Depth 10 | Set-Content -Path '$out' -Encoding UTF8
+    Write-Host 'Done - this window closes by itself.' -ForegroundColor Green
+    Start-Sleep -Seconds 1
+    exit 0
+} catch {
+    ('ERROR: ' + `$_.Exception.Message) | Set-Content -Path '$out' -Encoding UTF8
+    Write-Host "Failed: `$(`$_.Exception.Message)" -ForegroundColor Red
+    Start-Sleep -Seconds 6
+    exit 1
+}
+"@
+    $enc = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($full))
+    $ps = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $p = Start-Process -FilePath $ps -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', $enc) -PassThru
+    if (-not $p.WaitForExit($TimeoutMinutes * 60000)) { try { $p.Kill() } catch { }; throw "No answer within $TimeoutMinutes minutes - the helper window was closed." }
+    if (-not (Test-Path $out)) { throw "The $Title window was closed before it finished." }
+    $text = [System.IO.File]::ReadAllText($out).Trim()
+    Remove-Item $out -Force -ErrorAction SilentlyContinue
+    if ($text -like 'ERROR: *') { throw $text.Substring(7) }
+    $parsed = $text | ConvertFrom-Json
+    foreach ($x in $parsed) { $x }
+}
+
+# Azure sign-in part of every helper: reuses the saved Azure sign-in, signs in interactively only when needed
+function Get-AzPrelude {
+    param([string]$SubscriptionId, [switch]$ForceSignIn)
+    $sub = $SubscriptionId -replace "'", "''"
+    $force = if ($ForceSignIn) { '$true' } else { '$false' }
+@"
+Import-Module Az.Accounts
+Enable-AzContextAutosave -Scope CurrentUser | Out-Null
+if ($force -or -not (Get-AzContext)) {
+    Write-Host 'Sign in to Azure in the window or browser that opens...' -ForegroundColor Cyan
+    Connect-AzAccount | Out-Null
+}
+if ('$sub') { Set-AzContext -Subscription '$sub' | Out-Null }
+`$ctx = Get-AzContext
+Write-Host "Azure: `$(`$ctx.Account.Id) - `$(`$ctx.Subscription.Name)" -ForegroundColor Cyan
+"@
+}
+
+function ConvertTo-B64 { param([string]$Text) [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)) }
+
 function Connect-ToolAzure {
     param([string]$SubscriptionId)
-    Assert-Module 'Az.Accounts'
-    if (-not (Get-AzContext -ErrorAction SilentlyContinue)) { Connect-AzAccount -ErrorAction Stop | Out-Null }
-    if ($SubscriptionId) { Set-AzContext -Subscription $SubscriptionId -ErrorAction Stop | Out-Null }
-    $ctx = Get-AzContext
-    "$($ctx.Account.Id) - subscription $($ctx.Subscription.Name)"
+    Assert-ModuleAvailable 'Az.Accounts'
+    $code = (Get-AzPrelude -SubscriptionId $SubscriptionId -ForceSignIn) + "`r`n`$result = [pscustomobject]@{ Account = `$ctx.Account.Id; Subscription = `$ctx.Subscription.Name }"
+    $r = Invoke-HelperProcess -Code $code -Title 'Azure sign-in' | Select-Object -First 1
+    "$($r.Account) - subscription $($r.Subscription)"
 }
 
 function Get-AvdSessionHostNames {
     param([Parameter(Mandatory)][string]$ResourceGroup, [Parameter(Mandatory)][string]$HostPool, [string]$SubscriptionId)
-    Assert-Module 'Az.DesktopVirtualization'
-    $p = @{ ResourceGroupName = $ResourceGroup; HostPoolName = $HostPool; ErrorAction = 'Stop' }
-    if ($SubscriptionId) { $p.SubscriptionId = $SubscriptionId }
-    @(Get-AzWvdSessionHost @p | ForEach-Object { ($_.Name -split '/')[-1] })
+    Assert-ModuleAvailable 'Az.Accounts'; Assert-ModuleAvailable 'Az.DesktopVirtualization'
+    $code = (Get-AzPrelude -SubscriptionId $SubscriptionId) + @"
+
+Import-Module Az.DesktopVirtualization
+Write-Host 'Loading session hosts of host pool $($HostPool -replace "'", '')...' -ForegroundColor Cyan
+`$rg = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(ConvertTo-B64 $ResourceGroup)'))
+`$hp = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(ConvertTo-B64 $HostPool)'))
+`$result = @(Get-AzWvdSessionHost -ResourceGroupName `$rg -HostPoolName `$hp | ForEach-Object { (`$_.Name -split '/')[-1] })
+"@
+    foreach ($n in (Invoke-HelperProcess -Code $code -Title 'AVD host pool')) { if ($n) { [string]$n } }
 }
 
-function Invoke-AvdConnectionsQuery {
-    param([Parameter(Mandatory)][string]$WorkspaceId, [Parameter(Mandatory)][string]$User, [int]$Days = 7)
-    Assert-Module 'Az.OperationalInsights'
+# Connections of one user plus all their checkpoints / errors, in one helper run
+function Invoke-AvdInsightsQuery {
+    param([Parameter(Mandatory)][string]$WorkspaceId, [Parameter(Mandatory)][string]$User, [int]$Days = 7, [string]$SubscriptionId)
+    Assert-ModuleAvailable 'Az.Accounts'; Assert-ModuleAvailable 'Az.OperationalInsights'
     $u = $User -replace "'", "''"
-    $q = @"
+    $q1 = @"
 WVDConnections
 | where TimeGenerated > ago(${Days}d)
 | where UserName =~ '$u'
@@ -3132,35 +3278,40 @@ WVDConnections
 | order by Started desc
 | take 50
 "@
-    @((Invoke-AzOperationalInsightsQuery -WorkspaceId $WorkspaceId -Query $q -ErrorAction Stop).Results)
-}
-
-function Invoke-AvdCheckpointsQuery {
-    param([Parameter(Mandatory)][string]$WorkspaceId, [Parameter(Mandatory)][string]$CorrelationId)
-    Assert-Module 'Az.OperationalInsights'
-    $c = $CorrelationId -replace "'", "''"
-    $q = @"
-let cid = '$c';
+    $q2 = @"
 union
-  (WVDCheckpoints | where CorrelationId == cid | project TimeGenerated, Kind = 'Checkpoint', Name, Source, Details = tostring(Parameters)),
-  (WVDErrors | where CorrelationId == cid | project TimeGenerated, Kind = 'Error', Name = CodeSymbolic, Source, Details = Message)
+  (WVDCheckpoints | where TimeGenerated > ago(${Days}d) | where UserName =~ '$u' | project TimeGenerated, CorrelationId, Kind = 'Checkpoint', Name, Source, Details = tostring(Parameters)),
+  (WVDErrors | where TimeGenerated > ago(${Days}d) | where UserName =~ '$u' | project TimeGenerated, CorrelationId, Kind = 'Error', Name = CodeSymbolic, Source, Details = Message)
 | order by TimeGenerated asc
+| take 5000
 "@
-    @((Invoke-AzOperationalInsightsQuery -WorkspaceId $WorkspaceId -Query $q -ErrorAction Stop).Results)
+    $code = (Get-AzPrelude -SubscriptionId $SubscriptionId) + @"
+
+Import-Module Az.OperationalInsights
+Write-Host 'Querying AVD Insights...' -ForegroundColor Cyan
+`$ws = '$($WorkspaceId -replace "'", '')'
+`$q1 = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(ConvertTo-B64 $q1)'))
+`$q2 = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(ConvertTo-B64 $q2)'))
+`$c = @((Invoke-AzOperationalInsightsQuery -WorkspaceId `$ws -Query `$q1).Results | Select-Object *)
+`$k = @((Invoke-AzOperationalInsightsQuery -WorkspaceId `$ws -Query `$q2).Results | Select-Object *)
+`$result = [pscustomobject]@{ Connections = `$c; Checkpoints = `$k }
+"@
+    Invoke-HelperProcess -Code $code -Title 'AVD Insights' | Select-Object -First 1
 }
 
 function Get-ReleaseHealthIssues {
     param($E)
-    Assert-Module 'Microsoft.Graph.Authentication'
-    $ctx = Get-MgContext
-    if (-not $ctx -or @($ctx.Scopes) -notcontains 'WindowsUpdates.ReadWrite.All') { Connect-MgGraph -Scopes 'WindowsUpdates.ReadWrite.All' -NoWelcome -ErrorAction Stop }
-    $uri = 'https://graph.microsoft.com/beta/admin/windows/updates/products?$expand=knownIssues($expand=originatingKnowledgeBaseArticle,resolvingKnowledgeBaseArticle)'
-    $products = @()
-    do {
-        $resp = Invoke-MgGraphRequest -Method GET -Uri $uri -ErrorAction Stop
-        $products += @($resp.value)
-        $uri = $resp.'@odata.nextLink'
-    } while ($uri)
+    Assert-ModuleAvailable 'Microsoft.Graph.Authentication'
+    $code = @'
+Import-Module Microsoft.Graph.Authentication
+Write-Host 'Signing in to Microsoft Graph (WindowsUpdates.ReadWrite.All)...' -ForegroundColor Cyan
+Connect-MgGraph -Scopes 'WindowsUpdates.ReadWrite.All' -NoWelcome
+Write-Host 'Loading Windows release health known issues...' -ForegroundColor Cyan
+$uri = 'https://graph.microsoft.com/beta/admin/windows/updates/products?$expand=knownIssues($expand=originatingKnowledgeBaseArticle,resolvingKnowledgeBaseArticle)'
+$result = @()
+do { $resp = Invoke-MgGraphRequest -Method GET -Uri $uri; $result += @($resp.value); $uri = $resp.'@odata.nextLink' } while ($uri)
+'@
+    $products = @(Invoke-HelperProcess -Code $code -Title 'Windows release health')
     $want = @()
     if ($E.IsServer) { $want = @($products | Where-Object { "$($_.name)" -like 'Windows Server*' -and "$($_.name)" -like "*$(($E.Family -split ' ')[-1])*" }) }
     else { $fam = ($E.Family -split ' ')[0..1] -join ' '; $want = @($products | Where-Object { "$($_.name)" -like "*$fam*" -and "$($_.name)" -like "*$($E.DisplayVersion)*" }) }
@@ -4080,6 +4231,19 @@ $MainXaml = @'
       <ScrollViewer x:Name="PageAzure" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
         <StackPanel>
           <Border Style="{StaticResource Card}" Padding="18,14" Margin="0,0,0,14">
+            <DockPanel>
+              <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Top">
+                <Button x:Name="BtnModCheck" Style="{StaticResource BtnSecondary}" Content="Refresh" Margin="0,0,8,0"/>
+                <Button x:Name="BtnModInstall" Style="{StaticResource BtnPrimary}" Content="Install missing modules"/>
+              </StackPanel>
+              <StackPanel>
+                <TextBlock Text="PowerShell modules for the Azure features" Style="{StaticResource CardTitle}"/>
+                <TextBlock Text="The features on this tab and 'Load from AVD host pool' (Fleet) need these Microsoft modules from the PowerShell Gallery." Style="{StaticResource Hint}" Margin="0,4,0,8"/>
+                <TextBlock x:Name="TxtModules" FontFamily="Consolas" FontSize="12" Foreground="#344054" TextWrapping="Wrap"/>
+              </StackPanel>
+            </DockPanel>
+          </Border>
+          <Border Style="{StaticResource Card}" Padding="18,14" Margin="0,0,0,14">
             <StackPanel>
               <TextBlock Text="AVD Insights - connection timing from Azure" Style="{StaticResource CardTitle}"/>
               <TextBlock Text="Reads WVDConnections, WVDCheckpoints and WVDErrors from the Log Analytics workspace of your host pool diagnostics. Needs the Az.Accounts and Az.OperationalInsights modules and Log Analytics Reader rights." Style="{StaticResource Hint}" Margin="0,4,0,12"/>
@@ -4200,7 +4364,7 @@ $MainXaml = @'
             <Border Style="{StaticResource Card}" Padding="18,14" Margin="0,0,0,14">
               <StackPanel>
                 <TextBlock Text="Settings" Style="{StaticResource CardTitle}"/>
-                <TextBlock Style="{StaticResource Hint}" Margin="0,4,0,4" Text="Stored in C:\ProgramData\LogonBlackScreenAnalyzer\config.json and shared with the probe and report scripts. Saving needs administrator rights."/>
+                <TextBlock x:Name="TxtCfgPath" Style="{StaticResource Hint}" Margin="0,4,0,4"/>
                 <TextBlock Text="Webhook for user reports (Teams Workflows URL, optional)" Style="{StaticResource Lbl}"/>
                 <TextBox x:Name="TxtCfgWebhook" Style="{StaticResource Input}"/>
                 <TextBlock Text="Log Analytics workspace ID (AVD Insights)" Style="{StaticResource Lbl}"/>
@@ -4519,6 +4683,7 @@ function Start-BgJob {
     $rs.SessionStateProxy.SetVariable('LookbackDays', $LookbackDays)
     $rs.SessionStateProxy.SetVariable('KnownIssuesPath', $KnownIssuesPath)
     $rs.SessionStateProxy.SetVariable('ToolRoot', $ToolRoot)
+    $rs.SessionStateProxy.SetVariable('SettingsPath', $SettingsPath)
     foreach ($k in $Vars.Keys) { $rs.SessionStateProxy.SetVariable($k, $Vars[$k]) }
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
@@ -5043,6 +5208,7 @@ function Update-SettingsFields {
     $ui.TxtSharePath.Text = $cfg.SharePath; $ui.TxtCfgWebhook.Text = $cfg.WebhookUrl; $ui.TxtCfgWs.Text = $cfg.WorkspaceId
     $ui.TxtCfgSub.Text = $cfg.SubscriptionId; $ui.TxtCfgRg.Text = $cfg.HostPoolResourceGroup; $ui.TxtCfgPool.Text = $cfg.HostPoolName
     if (-not $ui.TxtAvdWs.Text) { $ui.TxtAvdWs.Text = $cfg.WorkspaceId }
+    $ui.TxtCfgPath.Text = "Saved next to the analyser in $SettingsPath. When the logon probe is installed on a host, it gets a copy of the share path and webhook."
     $ui.TxtKiPath.Text = $(if (Test-Path $KnownIssuesPath) { "Using $KnownIssuesPath" } else { "Built-in data is used. Click below to create an editable copy: $KnownIssuesPath" })
 }
 $ui.TxtGateCmd.Text = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"$MainScriptPath`" -Gate -GateLevel Problem -JsonPath C:\Windows\Temp\image-gate.json"
@@ -5057,7 +5223,7 @@ $ui.Tabs.Add_SelectionChanged({
     switch ($tag) {
         'FixHistory' { Update-FixHistory }
         'Tools'      { Update-ProbeStatus; Update-SettingsFields }
-        'Azure'      { Update-SettingsFields }
+        'Azure'      { Update-SettingsFields; Update-ModuleStatus }
     }
 })
 
@@ -5190,13 +5356,18 @@ $ui.CmbDiffCat.Add_SelectionChanged({
 $ui.BtnFleetPool.Add_Click({
     $cfg = Get-ToolConfig
     if (-not $cfg.HostPoolResourceGroup -or -not $cfg.HostPoolName) { [void](Show-Dialog -Title 'Host pool not configured' -Message 'Enter the host pool resource group and name in Tools > Settings first.' -Kind Warning); return }
-    try {
-        Set-Busy 'Signing in to Azure...'; Update-UiNow
-        [void](Connect-ToolAzure -SubscriptionId $cfg.SubscriptionId)
-        $names = @(Get-AvdSessionHostNames -ResourceGroup $cfg.HostPoolResourceGroup -HostPool $cfg.HostPoolName -SubscriptionId $cfg.SubscriptionId)
+    $ui.BtnFleetPool.IsEnabled = $false
+    $ui.TxtFleetInfo.Text = 'Loading session hosts in a separate PowerShell window - sign in there if Azure asks you to.'
+    Start-BgJob -Name 'Loading session hosts from the AVD host pool' -Script 'Get-AvdSessionHostNames -ResourceGroup $Rg -HostPool $Pool -SubscriptionId $Sub' `
+        -Vars @{ Rg = $cfg.HostPoolResourceGroup; Pool = $cfg.HostPoolName; Sub = $cfg.SubscriptionId } -State $cfg.HostPoolName -OnDone {
+        param($out, $err, $pool)
+        $ui.BtnFleetPool.IsEnabled = $true
+        if ($err) { $ui.TxtFleetInfo.Text = ''; Show-Error 'Could not load the host pool' $err; return }
+        $names = @($out | ForEach-Object { "$_" } | Where-Object { $_ })
         $ui.TxtFleetHosts.Text = $names -join "`r`n"
-        Clear-Busy "$($names.Count) session host(s) loaded from $($cfg.HostPoolName)"
-    } catch { Clear-Busy ''; Show-Error 'Could not load the host pool' $_.Exception.Message }
+        $ui.TxtFleetInfo.Text = "$($names.Count) session host(s) loaded from $pool."
+        Clear-Busy "$($names.Count) session host(s) loaded"
+    }
 })
 $ui.BtnFleetScan.Add_Click({
     $hosts = @($ui.TxtFleetHosts.Text -split "[`r`n,;]+" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -5230,35 +5401,87 @@ $ui.BtnFleetExport.Add_Click({
     try { Export-FleetReport -Fleet $script:Fleet -Path $dlg.FileName; Start-Process $dlg.FileName } catch { Show-Error 'Export failed' $_.Exception.Message }
 })
 
+# Azure - PowerShell modules
+function Update-ModuleStatus {
+    Set-Busy 'Checking PowerShell modules...'; Update-UiNow
+    $script:ModuleStatus = @(Get-RequiredModuleStatus)
+    $ui.TxtModules.Text = ($script:ModuleStatus | ForEach-Object { "{0,-32} {1,-18} {2}" -f $_.Name, $(if ($_.Installed) { "installed $($_.Version)" } else { 'MISSING' }), $_.Purpose }) -join "`r`n"
+    $missing = @($script:ModuleStatus | Where-Object { -not $_.Installed })
+    $ui.BtnModInstall.IsEnabled = $missing.Count -gt 0
+    $ui.BtnModInstall.Content = $(if ($missing) { "Install $($missing.Count) missing module(s)" } else { 'All modules installed' })
+    Clear-Busy ''
+}
+$ui.BtnModCheck.Add_Click({ Update-ModuleStatus })
+$ui.BtnModInstall.Add_Click({
+    $missing = @($script:ModuleStatus | Where-Object { -not $_.Installed })
+    if (-not $missing) { return }
+    $admin = [bool]($script:HostEnv -and $script:HostEnv.IsAdmin)
+    $where = if ($admin) { 'for all users of this computer (C:\Program Files\WindowsPowerShell\Modules)' } else { 'for your account only (Documents\WindowsPowerShell\Modules)' }
+    $msg = Join-Lines @(
+        "These Microsoft modules will be downloaded from the PowerShell Gallery (www.powershellgallery.com) and installed $($where):"
+        ($missing | ForEach-Object { "  - $($_.Name): $($_.Purpose)" })
+        ''
+        'The NuGet package provider is installed first if it is missing.'
+    )
+    $impact = Format-Bullets @(
+        'Needs internet access to www.powershellgallery.com. Downloads a few tens of MB and can take a few minutes.'
+        'Only the missing modules are installed - modules and versions that are already installed are not changed.'
+        $(if ($admin) { 'Installed for all users of this computer.' } else { 'Installed for your account only. With OneDrive Known Folder Move the Documents folder - and so the modules - is synced to OneDrive. Restart the tool as administrator to install for all users instead.' })
+        'No reboot. The Azure features can be used right after the installation.'
+        'If your organisation blocks the PowerShell Gallery, install the modules from your internal repository instead.'
+    )
+    if (-not (Show-Dialog -Title 'Install PowerShell modules?' -Message $msg -Impact $impact -OkText 'Install' -CancelText 'Cancel' -Kind Confirm)) { return }
+    $ui.BtnModInstall.IsEnabled = $false; $ui.BtnModInstall.Content = 'Installing...'
+    Start-BgJob -Name 'Installing PowerShell modules (this can take a few minutes)' -Script 'Install-RequiredModules -AllUsers:$All' -Vars @{ All = $admin } -OnDone {
+        param($out, $err)
+        Update-ModuleStatus
+        if ($err) { Show-Error 'Module installation failed' $err; return }
+        $text = (@($out) | ForEach-Object { "$_" }) -join "`r`n"
+        if ($text -match 'FAILED') { [void](Show-Dialog -Title 'Some modules could not be installed' -Message $text -OkText 'Close' -Kind Error) }
+        else { [void](Show-Dialog -Title 'Modules installed' -Message $text -Kind Success) }
+    }
+})
+
 # Azure
 $ui.BtnAzLogin.Add_Click({
-    try { Set-Busy 'Signing in to Azure...'; Update-UiNow; $who = Connect-ToolAzure -SubscriptionId (Get-ToolConfig).SubscriptionId; $ui.TxtAvdInfo.Text = "Signed in: $who"; Clear-Busy 'Signed in to Azure' }
-    catch { Clear-Busy ''; Show-Error 'Azure sign-in failed' $_.Exception.Message }
+    $ui.BtnAzLogin.IsEnabled = $false
+    $ui.TxtAvdInfo.Text = 'Sign in to Azure in the PowerShell window that opened.'
+    Start-BgJob -Name 'Waiting for the Azure sign-in' -Script 'Connect-ToolAzure -SubscriptionId $Sub' -Vars @{ Sub = (Get-ToolConfig).SubscriptionId } -OnDone {
+        param($out, $err)
+        $ui.BtnAzLogin.IsEnabled = $true
+        if ($err) { $ui.TxtAvdInfo.Text = ''; Show-Error 'Azure sign-in failed' $err; return }
+        $ui.TxtAvdInfo.Text = "Signed in: $($out | Select-Object -Last 1)"
+        Clear-Busy 'Signed in to Azure'
+    }
 })
 $ui.BtnAvdQuery.Add_Click({
     $ws = $ui.TxtAvdWs.Text.Trim(); $user = $ui.TxtAvdUser.Text.Trim()
     $days = 7; [void][int]::TryParse($ui.TxtAvdDays.Text, [ref]$days)
     if (-not $ws -or -not $user) { [void](Show-Dialog -Title 'Missing input' -Message 'Enter the Log Analytics workspace ID and the user principal name.' -Kind Warning); return }
-    try {
-        Set-Busy 'Querying AVD Insights...'; Update-UiNow
-        $script:AvdConns = @(Invoke-AvdConnectionsQuery -WorkspaceId $ws -User $user -Days $days)
+    $ui.BtnAvdQuery.IsEnabled = $false
+    $ui.TxtAvdInfo.Text = 'Querying AVD Insights in a separate PowerShell window - sign in there if Azure asks you to.'
+    Start-BgJob -Name 'Querying AVD Insights' -Script 'Invoke-AvdInsightsQuery -WorkspaceId $Ws -User $User -Days $Days -SubscriptionId $Sub' `
+        -Vars @{ Ws = $ws; User = $user; Days = $days; Sub = (Get-ToolConfig).SubscriptionId } -State @{ User = $user; Days = $days } -OnDone {
+        param($out, $err, $st)
+        $ui.BtnAvdQuery.IsEnabled = $true
+        if ($err) { $ui.TxtAvdInfo.Text = ''; Show-Error 'AVD Insights query failed' $err; return }
+        $res = $out | Select-Object -Last 1
+        $script:AvdConns = @($res.Connections | Where-Object { $_ })
+        $script:AvdCheckpoints = @($res.Checkpoints | Where-Object { $_ })
         $rows = foreach ($c in $script:AvdConns) { [ordered]@{ 'Started' = (ConvertFrom-IsoDate $c.Started); 'Session host' = $c.SessionHost; 'Client' = $c.Client; 'Seconds to connect' = (Get-InvariantNumber $c.SecondsToConnect); 'Correlation ID' = $c.CorrelationId } }
         Set-GridData $ui.GridAvdConn @($rows) $script:AvdConns
-        $ui.TxtAvdInfo.Text = "$($script:AvdConns.Count) connection(s) for $user in the last $days days. Select one to see its checkpoints."
+        Set-GridData $ui.GridAvdCp @() @()
+        $ui.TxtAvdInfo.Text = "$($script:AvdConns.Count) connection(s) for $($st.User) in the last $($st.Days) days. Select one to see its checkpoints."
         Clear-Busy 'AVD Insights query finished'
-    } catch { Clear-Busy ''; Show-Error 'AVD Insights query failed' $_.Exception.Message }
+    }
 })
 $ui.GridAvdConn.Add_SelectionChanged({
     $c = Get-GridSelection $ui.GridAvdConn
     if (-not $c) { return }
-    try {
-        Set-Busy 'Loading checkpoints...'; Update-UiNow
-        $cp = @(Invoke-AvdCheckpointsQuery -WorkspaceId $ui.TxtAvdWs.Text.Trim() -CorrelationId $c.CorrelationId)
-        $t0 = $null; if ($cp) { $t0 = ConvertFrom-IsoDate $cp[0].TimeGenerated }
-        $rows = foreach ($p in $cp) { $t = ConvertFrom-IsoDate $p.TimeGenerated; [ordered]@{ '+ s' = $(if ($t -and $t0) { [math]::Round(($t - $t0).TotalSeconds, 1) }); 'Time' = $t; 'Type' = $p.Kind; 'Name' = $p.Name; 'Source' = $p.Source; 'Details' = $p.Details } }
-        Set-GridData $ui.GridAvdCp @($rows) $cp
-        Clear-Busy "$($cp.Count) checkpoint(s)"
-    } catch { Clear-Busy ''; Show-Error 'Could not load checkpoints' $_.Exception.Message }
+    $cp = @($script:AvdCheckpoints | Where-Object { $_.CorrelationId -eq $c.CorrelationId } | Sort-Object { ConvertFrom-IsoDate $_.TimeGenerated })
+    $t0 = $null; if ($cp) { $t0 = ConvertFrom-IsoDate $cp[0].TimeGenerated }
+    $rows = foreach ($p in $cp) { $t = ConvertFrom-IsoDate $p.TimeGenerated; [ordered]@{ '+ s' = $(if ($t -and $t0) { [math]::Round(($t - $t0).TotalSeconds, 1) }); 'Time' = $t; 'Type' = $p.Kind; 'Name' = $p.Name; 'Source' = $p.Source; 'Details' = $p.Details } }
+    Set-GridData $ui.GridAvdCp @($rows) $cp
 })
 function Update-Rh {
     $items = @($script:RhIssues)
@@ -5270,8 +5493,16 @@ function Update-Rh {
 }
 $ui.BtnRh.Add_Click({
     if (-not $script:HostEnv) { [void](Show-Dialog -Title 'Scan first' -Message 'Wait for the scan to finish - the host version is needed.' -Kind Warning); return }
-    try { Set-Busy 'Signing in to Microsoft Graph...'; Update-UiNow; $script:RhIssues = @(Get-ReleaseHealthIssues -E $script:HostEnv); Update-Rh; Clear-Busy 'Release health loaded' }
-    catch { Clear-Busy ''; Show-Error 'Could not load release health' $_.Exception.Message }
+    $ui.BtnRh.IsEnabled = $false
+    $ui.TxtRhInfo.Text = 'Loading in a separate PowerShell window - sign in to Microsoft Graph there.'
+    Start-BgJob -Name 'Loading Windows release health' -Script 'Get-ReleaseHealthIssues -E $E' -Vars @{ E = $script:HostEnv } -OnDone {
+        param($out, $err)
+        $ui.BtnRh.IsEnabled = $true
+        if ($err) { $ui.TxtRhInfo.Text = ''; Show-Error 'Could not load release health' $err; return }
+        $script:RhIssues = @($out | Where-Object { $_ })
+        Update-Rh
+        Clear-Busy 'Release health loaded'
+    }
 })
 $ui.ChkRhRelevant.Add_Click({ if ($script:RhIssues) { Update-Rh } })
 $ui.GridRh.Add_SelectionChanged({ $i = Get-GridSelection $ui.GridRh; if ($i) { $ui.TxtRhDetail.Text = Join-Lines @($i.Description, '', $i.Url) } })
@@ -5397,9 +5628,9 @@ $ui.BtnCfgSave.Add_Click({
         $cfg = Get-ToolConfig
         $cfg.SharePath = $ui.TxtSharePath.Text.Trim(); $cfg.WebhookUrl = $ui.TxtCfgWebhook.Text.Trim(); $cfg.WorkspaceId = $ui.TxtCfgWs.Text.Trim()
         $cfg.SubscriptionId = $ui.TxtCfgSub.Text.Trim(); $cfg.HostPoolResourceGroup = $ui.TxtCfgRg.Text.Trim(); $cfg.HostPoolName = $ui.TxtCfgPool.Text.Trim()
-        Save-ToolConfig $cfg
-        [void](Show-Dialog -Title 'Settings saved' -Message "Saved to $ToolBase\config.json." -Kind Success)
-    } catch { Show-Error 'Could not save the settings' "$($_.Exception.Message)`r`n`r`nSaving needs administrator rights." }
+        $note = Save-ToolConfig $cfg
+        [void](Show-Dialog -Title 'Settings saved' -Message (Join-Lines @("Saved to $SettingsPath", $(if ($note) { ''; $note }))) -Kind Success)
+    } catch { Show-Error 'Could not save the settings' "$($_.Exception.Message)`r`n`r`nCheck that the folder of the analyser is writable." }
 })
 $ui.BtnKiOpen.Add_Click({
     if (-not (Test-Path $KnownIssuesPath)) {
@@ -5438,6 +5669,8 @@ $win.Add_Closing({
 $ToolRoot = $PSScriptRoot
 $MainScriptPath = $PSCommandPath
 if (-not $KnownIssuesPath) { $KnownIssuesPath = Join-Path $ToolRoot 'KnownIssues.json' }
+# Settings are saved next to this script
+$SettingsPath = [System.IO.Path]::ChangeExtension($PSCommandPath, '.settings.json')
 $script:EngineText = $EngineBlock.ToString()
 $script:CoreAll = $script:EngineText + "`n" + $ExtrasBlock.ToString()
 $script:ProbeText = $ProbeBlock.ToString()
@@ -5482,6 +5715,12 @@ if ($InstallProbe -or $UninstallProbe) {
         if ($PSBoundParameters.ContainsKey('SharePath')) { $p.SharePath = $SharePath }
         Install-LogonProbe @p
     }
+    return
+}
+
+if ($InstallModules) {
+    Get-RequiredModuleStatus | Format-Table Name, Installed, Version, Purpose -AutoSize | Out-Host
+    Install-RequiredModules -AllUsers:$isAdminNow
     return
 }
 
