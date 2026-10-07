@@ -1148,8 +1148,11 @@ Register-Check -Id 'TIM-02' -Category 'Measured logon timing' -Weight 3 `
             }
         }
         $topDur = $dur | Group-Object Subscriber | ForEach-Object {
-            [pscustomobject]@{ Subscriber = $_.Name; Max = ($_.Group | Measure-Object Seconds -Maximum).Maximum }
+            $w = $_.Group | Sort-Object Seconds -Descending | Select-Object -First 1
+            [pscustomobject]@{ Subscriber = $_.Name; Max = $w.Seconds; Event = $w.Event }
         } | Sort-Object Max -Descending | Select-Object -First 8
+        # Subscribers that work when the host restarts / shuts down (servicing), not during a user sign-in
+        $notLogon = @('TrustedInstaller')
         $meaning = @{
             'Profiles' = 'User Profile Service / FSLogix container attach'; 'GPClient' = 'Group Policy'
             'SessionEnv' = 'RDS session environment (see Sep 2026 RDS issue)'; 'TermSrv' = 'Remote Desktop Services'
@@ -1163,10 +1166,13 @@ Register-Check -Id 'TIM-02' -Category 'Measured logon timing' -Weight 3 `
             "Event 6005 (subscriber is taking long): $($long.Count)  $(($long | Group-Object | ForEach-Object { "$($_.Name)=$($_.Count)" }) -join ', ')"
             ''
             'Slowest subscribers from Winlogon/Operational (811/812):'
-            ($topDur | ForEach-Object { "  {0,-22} max {1}s{2}" -f $_.Subscriber, $_.Max, (& $explain $_.Subscriber) })
+            ($topDur | ForEach-Object { "  {0,-22} max {1}s (event {2}){3}{4}" -f $_.Subscriber, $_.Max, $_.Event, (& $explain $_.Subscriber), $(if ($notLogon -contains $_.Subscriber) { ' - not counted: works at restart / shutdown after updates, not during sign-in' } else { '' }) })
         )
-        $worst = $slow | Sort-Object Seconds -Descending | Select-Object -First 1
-        $worstOp = $topDur | Select-Object -First 1
+        $logonSlow = @($slow | Where-Object { $notLogon -notcontains $_.Subscriber })
+        $logonLong = @($long | Where-Object { $notLogon -notcontains $_ })
+        $logonDur = @($topDur | Where-Object { $notLogon -notcontains $_.Subscriber })
+        $worst = $logonSlow | Sort-Object Seconds -Descending | Select-Object -First 1
+        $worstOp = $logonDur | Select-Object -First 1
         $fix = Format-Steps @(
             'Read the slowest subscriber in the evidence - it tells you which logon phase blocks the desktop.'
             'Profiles = profile load: see TIM-03, PRF-01, PRF-02, PRF-04.'
@@ -1176,11 +1182,12 @@ Register-Check -Id 'TIM-02' -Category 'Measured logon timing' -Weight 3 `
         )
         if (($worst -and $worst.Seconds -ge 30) -or ($worstOp -and $worstOp.Max -ge 30)) {
             $n = if ($worst) { "$($worst.Subscriber) $($worst.Seconds)s" } else { "$($worstOp.Subscriber) $($worstOp.Max)s" }
-            return New-Result Problem "Winlogon waited a long time on a subscriber (worst: $n)." $detail $fix -Impact $NoChangeImpact
+            return New-Result Problem "Winlogon waited a long time on a subscriber during sign-in (worst: $n)." $detail $fix -Impact $NoChangeImpact
         }
-        if ($slow -or $long -or ($worstOp -and $worstOp.Max -ge 10)) { return New-Result Warning 'Some Winlogon subscribers are slow.' $detail $fix -Impact $NoChangeImpact }
+        if ($logonSlow -or $logonLong -or ($worstOp -and $worstOp.Max -ge 10)) { return New-Result Warning 'Some Winlogon subscribers are slow during sign-in.' $detail $fix -Impact $NoChangeImpact }
         if (-not $dur) { return New-Result Info 'No Winlogon timing events found in the window.' $detail }
-        New-Result OK 'No slow Winlogon subscribers.' $detail
+        $fastest = if ($worstOp) { "slowest sign-in step: $($worstOp.Subscriber) $($worstOp.Max) s" } else { 'no slow sign-in steps' }
+        New-Result OK "Winlogon finishes quickly ($fastest). If users still wait, the time is spent after the hand-over to the desktop - first sign-in screens (ENT-03, ENT-01, ENT-02), shell start and Run keys (TIM-04); see the Logon timeline." $detail
     }
 
 Register-Check -Id 'TIM-03' -Category 'Measured logon timing' -Weight 3 `
@@ -1239,20 +1246,45 @@ Register-Check -Id 'TIM-04' -Category 'Measured logon timing' -Weight 1 `
             elseif ($open.ContainsKey($key)) { $cmds += [pscustomobject]@{ Command = $c; Seconds = [math]::Round(($e.TimeCreated - $open[$key]).TotalSeconds, 1) }; $open.Remove($key) }
         }
         if (-not $cmds) { return New-Result Info 'No Run-key timing events found.' 'Shell-Core/Operational 9707/9708 not present in the window.' }
-        $top = $cmds | Group-Object Command | ForEach-Object { [pscustomobject]@{ Command = $_.Name; Max = ($_.Group | Measure-Object Seconds -Maximum).Maximum } } | Sort-Object Max -Descending | Select-Object -First 8
-        $detail = Join-Lines ($top | ForEach-Object { "  {0,6}s  {1}" -f $_.Max, $_.Command })
-        if (($top | Select-Object -First 1).Max -ge 30) {
-            $fix = Format-Steps @(
-                'Identify the slow commands in the evidence.'
-                'Remove Run entries that are not needed on session hosts, or start them delayed through a scheduled task.'
-            )
-            $impact = Format-Bullets @(
-                'The application no longer starts automatically at logon (or starts later) - users may need to start it themselves.'
-                'No reboot.'
-            )
-            return New-Result Warning 'Some Run-key commands take a long time (they compete with the shell during logon).' $detail $fix -Impact $impact
-        }
-        New-Result Info 'Run-key commands timing.' $detail
+        $all = @($cmds | Group-Object Command | ForEach-Object { [pscustomobject]@{ Command = $_.Name; Max = ($_.Group | Measure-Object Seconds -Maximum).Maximum; Runs = $_.Count } } | Sort-Object Max -Descending)
+        # Explorer stops tracking a started program after about 30 s, so ~30 s just means "still running" (tray apps)
+        $isCapped = { param($s) $s -ge 29.5 -and $s -le 32 }
+        $slow = @($all | Where-Object { $_.Max -gt 45 })
+        $edgeCleanup = @($all | Where-Object { $_.Command -match 'delete-old-versions' })
+        $detail = Join-Lines @(
+            "$($all.Count) different program(s) are started from the Run keys at logon (every user starts them on a multi-session host)."
+            ''
+            ($all | Select-Object -First 15 | ForEach-Object {
+                $note = ''
+                if ($_.Command -match 'delete-old-versions') { $note = '   <- Edge/WebView2 update cleanup' }
+                elseif (& $isCapped $_.Max) { $note = '   (still running at the ~30 s tracking limit - normal for apps that stay open)' }
+                elseif ($_.Max -gt 45) { $note = '   <- slow' }
+                "  {0,6}s  {1}  [{2} logon(s)]{3}" -f $_.Max, $_.Command, $_.Runs, $note
+            })
+        )
+        $fix = Format-Steps @(
+            $(if ($edgeCleanup) { 'Edge / WebView2 "setup.exe ... --delete-old-versions ... --on-logon" is an update cleanup that runs when old versions were still in use. Reboot the host after Edge / WebView2 updates so it can finish. If it keeps appearing, find it with the command below, run it once elevated or remove the stale entry, and keep WebView2 current in the golden image.' })
+            'Remove Run entries for programs users do not need on the session hosts (vendor helpers, licence or sync agents), or start them later through a scheduled task with a delay.'
+            'Entries at about 30 s are programs that keep running (tray apps) - remove them only if they are not needed.'
+        )
+        $impact = Format-Bullets @(
+            'Removing a Run entry: that program no longer starts automatically for any user - users start it themselves if they need it.'
+            $(if ($edgeCleanup) { 'Letting the WebView2 cleanup finish (reboot or one elevated run) only removes old WebView2 versions - no user-visible change. Drain the host before a reboot.' })
+            'Changing Run entries needs no reboot; it applies from the next logon.'
+        )
+        $cmd = @'
+# Lists all Run / RunOnce entries (read-only)
+foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce',
+               'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce',
+               'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce') {
+    $i = Get-Item $k -ErrorAction SilentlyContinue
+    if ($i) { foreach ($n in $i.GetValueNames()) { "$k  ->  $n = $($i.GetValue($n))" } }
+}
+'@
+        $metrics = @{ RunKeyPrograms = $all.Count; RunKeySlowestSec = ($all | Select-Object -First 1).Max }
+        if ($edgeCleanup) { return New-Result Warning "The Edge / WebView2 update cleanup runs at logon and took up to $(($edgeCleanup | Select-Object -First 1).Max) s - it competes with the logon and can repeat at every sign-in until it completes." $detail $fix $cmd -Impact $impact -Metrics $metrics }
+        if ($slow) { return New-Result Warning "$($slow.Count) Run-key program(s) take longer than 45 s at logon (they compete with the shell)." $detail $fix $cmd -Impact $impact -Metrics $metrics }
+        New-Result Info "$($all.Count) program(s) start from the Run keys at logon; none is unusually slow (about 30 s means the program keeps running, which is normal)." $detail $fix $cmd -Impact $impact -Metrics $metrics
     }
 #endregion
 
@@ -1636,7 +1668,7 @@ Register-Check -Id 'ENT-02' -Category 'Entra ID / Intune first logon' -Weight 2 
         New-Result Warning 'The Enrollment Status Page user phase is not skipped - each new user can be held on "Account setup" before the desktop appears.' $detail $fix $cmd -Impact $impact -AutoFix $auto
     }
 
-Register-Check -Id 'ENT-03' -Category 'Entra ID / Intune first logon' -Weight 1 -Tags 'Image', 'Intune' `
+Register-Check -Id 'ENT-03' -Category 'Entra ID / Intune first logon' -Weight 3 -Tags 'Image', 'Intune' `
     -Name 'Privacy settings screen at first sign-in' `
     -AppliesTo { param($E) $E.IsClient -and $E.Build -ge 17134 } `
     -NotApplicableReason 'Only Windows 10 1803+ / Windows 11 (incl. multi-session).' `
@@ -1652,13 +1684,13 @@ Register-Check -Id 'ENT-03' -Category 'Entra ID / Intune first logon' -Weight 1 
         )
         $impact = Format-Bullets @(
             'New users are no longer shown "Choose privacy settings for your device" at first sign-in.'
-            'Privacy settings (diagnostic data, location, ...) then follow Windows defaults and your policies instead of the user choice.'
-            'No reboot.'
+            'Privacy settings (diagnostic data, location, tailored experiences, advertising ID) then follow Windows defaults and your policies instead of the user choice - set "Turn off tailored experiences" / "Turn off the advertising ID" by policy if you want them off.'
+            'No reboot; takes effect at the next sign-in.'
         )
         $cmd = (New-RegBackupCmd -Key 'HKLM\SOFTWARE\Policies\Microsoft\Windows\OOBE' -Name 'OOBE') + "`r`n" +
                "New-Item -Path '$key' -Force | Out-Null`r`nNew-ItemProperty -Path '$key' -Name DisablePrivacyExperience -PropertyType DWord -Value 1 -Force | Out-Null`r`n'DisablePrivacyExperience set to 1.'"
         $auto = New-AutoFix -Label 'Disable the privacy settings screen' -Backup -Changes 'Backs up the OOBE policy key and sets DisablePrivacyExperience = 1.'
-        if ($E.IsSessionHost) { return New-Result Warning 'New users may get the "Choose privacy settings" screen at first sign-in before the desktop.' $detail $fix $cmd -Impact $impact -AutoFix $auto }
+        if ($E.IsSessionHost) { return New-Result Problem 'The "Choose privacy settings" screen is not disabled. It opens before the desktop for every new (or non-persisted) profile - through the AVD client it typically shows as a black screen, while a plain RDP connection to the host shows the privacy pages.' $detail $fix $cmd -Impact $impact -AutoFix $auto }
         New-Result Info 'The privacy settings screen can appear at first sign-in of new users.' $detail $fix $cmd -Impact $impact -AutoFix $auto
     }
 #endregion
