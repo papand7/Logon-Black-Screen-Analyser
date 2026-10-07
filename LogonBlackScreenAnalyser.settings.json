@@ -1,0 +1,8 @@
+{
+    "SharePath":  "",
+    "WebhookUrl":  "",
+    "WorkspaceId":  "",
+    "SubscriptionId":  "3e302e70-0c69-4654-adcc-445d912bad64",
+    "HostPoolResourceGroup":  "AVD-RG",
+    "HostPoolName":  "avd"
+}

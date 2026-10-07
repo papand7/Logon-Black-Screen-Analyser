@@ -93,22 +93,50 @@ param(
 
 $cliMode = $NoGui -or $Gate -or $ComputerName -or $SaveBaseline -or $CompareBaseline -or $SupportBundle -or $ExportIntune -or $InstallProbe -or $UninstallProbe -or $InstallModules
 
+#region Windows PowerShell module path
+# Started from PowerShell 7, the process (and everything it starts) inherits PowerShell 7's module folders in
+# PSModulePath. Windows PowerShell then loads PowerShell 7 versions of its built-in modules and functions such as
+# New-Guid go missing - which breaks the Az modules. Keep only the Windows PowerShell module folders.
+$WinPSModulePath = {
+    $list = New-Object System.Collections.Generic.List[string]
+    $candidates = @((Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'WindowsPowerShell\Modules'), (Join-Path $env:ProgramFiles 'WindowsPowerShell\Modules')) +
+                  @([Environment]::GetEnvironmentVariable('PSModulePath', 'Machine') -split ';') +
+                  @((Join-Path $env:SystemRoot 'system32\WindowsPowerShell\v1.0\Modules'))
+    foreach ($p in $candidates) {
+        if (-not $p) { continue }
+        $p = [Environment]::ExpandEnvironmentVariables($p).TrimEnd('\')
+        if ($p -match '\\PowerShell\\7|\\Documents\\PowerShell\\Modules$|\\Program Files( \(x86\))?\\PowerShell\\') { continue }
+        if (-not ($list -contains $p)) { $list.Add($p) }
+    }
+    $list -join ';'
+}
+#endregion
+
 #region Relaunch in Windows PowerShell 5.1 / STA when needed
 $needsRelaunch = ($PSVersionTable.PSEdition -eq 'Core') -or (-not $cliMode -and [System.Threading.Thread]::CurrentThread.ApartmentState -ne 'STA')
 if ($needsRelaunch) {
+    $env:PSModulePath = & $WinPSModulePath
     if ($Credential) { Write-Error 'Start the script from Windows PowerShell 5.1 when you use -Credential.'; exit 2 }
-    $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
+    # Two argument lists: raw values for the call operator (PowerShell quotes them itself - pre-quoted values break
+    # in PowerShell 7.3+), and pre-quoted values for Start-Process (which joins the list without quoting)
+    $rawArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', $PSCommandPath)
+    $quotedArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-File', "`"$PSCommandPath`"")
     foreach ($k in $PSBoundParameters.Keys) {
         $v = $PSBoundParameters[$k]
-        if ($v -is [System.Management.Automation.SwitchParameter]) { if ($v.IsPresent) { $argList += "-$k" } }
-        elseif ($v -is [array]) { $argList += "-$k"; $argList += "`"$($v -join ',')`"" }
-        else { $argList += "-$k"; $argList += "`"$v`"" }
+        if ($v -is [System.Management.Automation.SwitchParameter]) { if ($v.IsPresent) { $rawArgs += "-$k"; $quotedArgs += "-$k" } }
+        else {
+            $s = if ($v -is [array]) { $v -join ',' } else { "$v" }
+            $rawArgs += @("-$k", $s); $quotedArgs += @("-$k", "`"$s`"")
+        }
     }
     $ps51 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    if ($cliMode) { & $ps51 @argList; exit $LASTEXITCODE }
-    Start-Process -FilePath $ps51 -ArgumentList $argList
+    if ($cliMode) { & $ps51 @rawArgs; exit $LASTEXITCODE }
+    Start-Process -FilePath $ps51 -ArgumentList $quotedArgs
     return
 }
+# Running in Windows PowerShell 5.1 from here: clean module path for this process, the background jobs and the
+# helper windows (Azure / Graph), which all inherit it
+$env:PSModulePath = & $WinPSModulePath
 #endregion
 
 # ======================================================================================================
@@ -785,7 +813,7 @@ Register-Check -Id 'UPD-04' -Category 'Windows update (known issue)' -Weight 1 -
             'The host is unavailable for roughly 5-15 minutes while the update finishes.'
             'No configuration change - it only completes the update that is already installed.'
         )
-        if ($cbs -or $wu) { return New-Result Warning 'A reboot is pending to finish installing updates. Half-installed cumulative updates often break AppX/shell registration at logon.' $detail $fix 'Restart-Computer' -Impact $impact }
+        if ($cbs -or $wu) { return New-Result Warning 'A reboot is pending to finish installing updates. Half-installed cumulative updates often break AppX/shell registration at logon.' $detail $fix '# The analyser never reboots. Drain the host first, then reboot it yourself (Azure portal, your AVD tooling, or Restart-Computer on the host).' -Impact $impact }
         New-Result OK 'No pending update reboot.' $detail
     }
 #endregion
@@ -2416,12 +2444,14 @@ if ($log.MaximumSizeInBytes -lt 268435456) { wevtutil.exe sl Security /ms:268435
 $StatusOrder = @{ 'Problem' = 0; 'Warning' = 1; 'Error' = 2; 'Info' = 3; 'OK' = 4; 'N/A' = 5 }
 
 function Invoke-AllChecks {
-    param($E, [scriptblock]$OnResult, [string[]]$OnlyIds, [string]$Tag)
+    param($E, [scriptblock]$OnResult, [string[]]$OnlyIds, [string]$Tag, [scriptblock]$OnStart)
     $i = 0; $n = $script:Checks.Count
     foreach ($c in $script:Checks) {
         $i++
         if ($OnlyIds -and $OnlyIds -notcontains $c.Id) { continue }
         if ($Tag -and @($c.Tags) -notcontains $Tag) { continue }
+        if ($OnStart) { & $OnStart $c $i $n }
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $applies = $true
         if ($c.AppliesTo) { try { $applies = [bool](& $c.AppliesTo $E) } catch { $applies = $false } }
         if (-not $applies) {
@@ -2442,6 +2472,7 @@ function Invoke-AllChecks {
         $r | Add-Member -NotePropertyMembers ([ordered]@{
             Id = $c.Id; Category = $c.Category; Name = $c.Name; Weight = $c.Weight; Score = $score; Tags = @($c.Tags)
             SortKey = '{0}{1:D2}{2:D3}' -f $StatusOrder[$r.Status], (99 - $score), $i
+            Ms = [int]$sw.ElapsedMilliseconds
         }) -Force
         if ($OnResult) { & $OnResult $r $i $n }
         $r
@@ -3201,11 +3232,17 @@ function Export-FleetReport {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.Append("<!doctype html><html><head><meta charset='utf-8'><title>Logon black screen - fleet report</title><style>$ReportCss td.c{text-align:center;padding:4px}</style></head><body>")
     [void]$sb.Append("<header><h1>Logon black screen - fleet report</h1><div>$(@($Fleet.Hosts).Count) host(s) scanned $(& $enc $Fleet.Time), $(@($Fleet.Failed).Count) unreachable</div></header><main>")
-    [void]$sb.Append('<div class="card"><table><tr><th>Host</th><th>OS / build</th><th>Problems</th><th>Warnings</th><th>Most likely cause</th></tr>')
+    $timed = @($Fleet.Hosts | Where-Object { $_.PSObject.Properties['Duration'] -and $null -ne $_.Duration }).Count -gt 0
+    [void]$sb.Append("<div class=`"card`"><table><tr><th>Host</th><th>OS / build</th><th>Problems</th><th>Warnings</th><th>Most likely cause</th>$(if ($timed) { '<th>Scan time (slowest checks)</th>' })</tr>")
     foreach ($h in ($Fleet.Hosts | Sort-Object Computer)) {
         $p = @($h.Results | Where-Object Status -eq 'Problem').Count; $w = @($h.Results | Where-Object Status -eq 'Warning').Count
         $top = Get-TopCauses $h.Results 1
-        [void]$sb.Append("<tr><td><b>$(& $enc $h.Computer)</b></td><td>$(& $enc $h.Env.Family) $(& $enc $h.Env.BuildString)</td><td>$p</td><td>$w</td><td>$(if ($top) { (& $enc "$($top.Name): $($top.Summary)") })</td></tr>")
+        $tcell = ''
+        if ($timed) {
+            $tt = ''; if ($h.PSObject.Properties['Duration'] -and $null -ne $h.Duration) { $tt = Format-Duration $h.Duration; if (@($h.Slow).Count) { $tt += ' (' + ((@($h.Slow) | Select-Object -First 3 | ForEach-Object { "$($_.Id) $(Format-Duration $_.Seconds)" }) -join ', ') + ')' } }
+            $tcell = "<td>$(& $enc $tt)</td>"
+        }
+        [void]$sb.Append("<tr><td><b>$(& $enc $h.Computer)</b></td><td>$(& $enc $h.Env.Family) $(& $enc $h.Env.BuildString)</td><td>$p</td><td>$w</td><td>$(if ($top) { (& $enc "$($top.Name): $($top.Summary)") })</td>$tcell</tr>")
     }
     [void]$sb.Append('</table></div><div class="card" style="overflow-x:auto"><table><tr><th>Host</th>')
     foreach ($id in $ids) { [void]$sb.Append("<th>$(& $enc $id)</th>") }
@@ -3245,6 +3282,12 @@ function Invoke-HelperProcess {
 `$Host.UI.RawUI.WindowTitle = 'Logon Black Screen Analyser - $Title'
 `$ErrorActionPreference = 'Stop'
 `$result = `$null
+# The Az modules call New-Guid in every command. If Windows PowerShell picked up PowerShell 7's Utility module
+# (mixed module paths), New-Guid is missing - load the right module, or fall back to an equivalent function.
+if (-not (Get-Command New-Guid -ErrorAction SilentlyContinue)) {
+    Import-Module (Join-Path `$PSHOME 'Modules\Microsoft.PowerShell.Utility\Microsoft.PowerShell.Utility.psd1') -Force -ErrorAction SilentlyContinue
+    if (-not (Get-Command New-Guid -ErrorAction SilentlyContinue)) { function global:New-Guid { [guid]::NewGuid() } }
+}
 try {
 $Code
     ConvertTo-Json -InputObject @(`$result) -Depth 10 | Set-Content -Path '$out' -Encoding UTF8
@@ -3252,7 +3295,8 @@ $Code
     Start-Sleep -Seconds 1
     exit 0
 } catch {
-    ('ERROR: ' + `$_.Exception.Message) | Set-Content -Path '$out' -Encoding UTF8
+    `$diag = "PowerShell `$(`$PSVersionTable.PSVersion) `$(`$PSVersionTable.PSEdition); language mode: `$(`$ExecutionContext.SessionState.LanguageMode); Utility module: `$((Get-Command Write-Host -ErrorAction SilentlyContinue).Module.Path); PSModulePath: `$(`$env:PSModulePath)"
+    ('ERROR: ' + `$_.Exception.Message + "``r``n``r``nDiagnostics: `$diag") | Set-Content -Path '$out' -Encoding UTF8
     Write-Host "Failed: `$(`$_.Exception.Message)" -ForegroundColor Red
     Start-Sleep -Seconds 6
     exit 1
@@ -3315,14 +3359,110 @@ Write-Host 'Loading session hosts of host pool $($HostPool -replace "'", '')...'
 # Fleet scan through Azure Run Command: no WinRM / Kerberos needed, runs as SYSTEM on each VM via the VM agent.
 # Run Command returns only the last 4,096 bytes of output, so each VM sends back a gzip+base64 compact result
 # (status per check + summaries of the findings); names and categories come from the local check list.
+#
+# A Run Command can't be cancelled and the VM runs only one at a time, so the scan guards itself: every check
+# runs in a worker runspace, a check that takes longer than CheckLimitSeconds is skipped (reported as Error)
+# and the rest continues in a fresh worker; after BudgetMinutes the remaining checks are skipped. Progress is
+# written to C:\ProgramData\LogonBlackScreenAnalyzer\RunCommand.log on the VM. Nothing is changed on the VM.
 function New-RunCommandScanScript {
-    param([Parameter(Mandatory)][string]$EngineText, [int]$Days = 7, [string]$KnownIssuesText)
+    param([Parameter(Mandatory)][string]$EngineText, [int]$Days = 7, [string]$KnownIssuesText, [int]$CheckLimitSeconds = 180, [int]$BudgetMinutes = 20)
     $ki = ''
     if ($KnownIssuesText) { $ki = "`$KnownIssuesJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(ConvertTo-B64 $KnownIssuesText)'))" }
+    $head = "`$ErrorActionPreference = 'Continue'`r`n`$ProgressPreference = 'SilentlyContinue'`r`n" +
+            "`$LbsPrelude = {`r`n`$ErrorActionPreference = 'Continue'`r`n`$ProgressPreference = 'SilentlyContinue'`r`n`$LookbackDays = $Days`r`n$ki`r`n}`r`n" +
+            "`$LbsCheckLimit = $CheckLimitSeconds`r`n`$LbsBudgetMinutes = $BudgetMinutes`r`n" +
+            "`$LbsEngine = {`r`n" + $EngineText + "`r`n}`r`n"
     $tail = @'
+$LbsLogFn = {
+    function Write-LbsLog([string]$Text) { if ($LbsLog) { try { Add-Content -Path $LbsLog -Value ('{0:HH:mm:ss}  {1}' -f (Get-Date), $Text) -Encoding UTF8 } catch { } } }
+}
+# Worker: runs the checks that are not done or skipped yet, one at a time, and reports each one to the watchdog
+$LbsWorker = {
+    $done = @{}
+    foreach ($x in @($LbsSync.Results)) { $done[$x.Id] = $true }
+    foreach ($x in @($LbsSkip)) { $done[$x] = $true }
+    foreach ($c in $script:Checks) {
+        if ($done[$c.Id]) { continue }
+        $LbsSync.Cur = @($c.Id, [datetime]::UtcNow)
+        Write-LbsLog "$($c.Id) started"
+        $r = @(Invoke-AllChecks -E $E -OnlyIds @($c.Id)) | Select-Object -Last 1
+        if ($r) { [void]$LbsSync.Results.Add($r); Write-LbsLog ('{0} {1} ({2:N1} s)' -f $c.Id, $r.Status, ($r.Ms / 1000)) }
+    }
+    $LbsSync.Cur = $null
+}
 
+. $LbsPrelude
+. $LbsEngine
+. $LbsLogFn
+$LbsWatch = [System.Diagnostics.Stopwatch]::StartNew()
+$LbsLog = Join-Path $env:ProgramData 'LogonBlackScreenAnalyzer\RunCommand.log'
+try {
+    New-Item -ItemType Directory -Force (Split-Path $LbsLog) | Out-Null
+    Set-Content -Path $LbsLog -Value ('{0:yyyy-MM-dd HH:mm:ss}  Scan started (Azure Run Command, SYSTEM, PID {1}) - checks are skipped after {2} s, the scan after {3} min' -f (Get-Date), $PID, $LbsCheckLimit, $LbsBudgetMinutes) -Encoding UTF8
+} catch { $LbsLog = $null }
 $E = Get-HostEnvironment
-$res = @(Invoke-AllChecks -E $E)
+Write-LbsLog ('Host environment read ({0:N1} s)' -f $LbsWatch.Elapsed.TotalSeconds)
+
+$LbsSync = [hashtable]::Synchronized(@{ Cur = $null; Results = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList)) })
+$LbsSkip = New-Object System.Collections.Generic.List[string]
+$LbsTimedOut = @{}
+$LbsAbandoned = 0
+$LbsDeadline = [datetime]::UtcNow.AddMinutes($LbsBudgetMinutes)
+$LbsWorkerText = $LbsPrelude.ToString() + "`r`n" + $LbsEngine.ToString() + "`r`n" + $LbsLogFn.ToString() + "`r`n" + $LbsWorker.ToString()
+while ($true) {
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.ApartmentState = 'STA'
+    $rs.Open()
+    $rs.SessionStateProxy.SetVariable('LbsSync', $LbsSync)
+    $rs.SessionStateProxy.SetVariable('LbsSkip', @($LbsSkip))
+    $rs.SessionStateProxy.SetVariable('LbsLog', $LbsLog)
+    $rs.SessionStateProxy.SetVariable('E', $E)
+    $ps = [powershell]::Create(); $ps.Runspace = $rs
+    [void]$ps.AddScript($LbsWorkerText)
+    $LbsSync.Cur = $null
+    $h = $ps.BeginInvoke()
+    $stuck = $null
+    while (-not $h.IsCompleted) {
+        [void]$h.AsyncWaitHandle.WaitOne(500)
+        $cur = $LbsSync.Cur
+        if ($cur -and ([datetime]::UtcNow - $cur[1]).TotalSeconds -gt $LbsCheckLimit) { $stuck = $cur[0]; break }
+        if ([datetime]::UtcNow -gt $LbsDeadline) { $stuck = '*'; break }
+    }
+    if (-not $stuck) {
+        try { [void]$ps.EndInvoke($h) } catch { Write-LbsLog "Worker error: $($_.Exception.Message)" }
+        foreach ($x in @($ps.Streams.Error) | Select-Object -First 5) { Write-LbsLog "Worker error: $x" }
+        $ps.Dispose(); $rs.Dispose()
+        break
+    }
+    # Leave the stuck worker behind (it can't be stopped reliably while inside a slow call) and carry on
+    $LbsAbandoned++
+    try { [void]$ps.BeginStop($null, $null) } catch { }
+    if ($stuck -eq '*') { Write-LbsLog "Time budget of $LbsBudgetMinutes min used up - remaining checks skipped"; break }
+    $LbsTimedOut[$stuck] = $true
+    $LbsSkip.Add($stuck)
+    Write-LbsLog "$stuck did not finish within $LbsCheckLimit s - skipped"
+}
+
+$byId = @{}
+foreach ($r in @($LbsSync.Results)) { if (-not $byId.ContainsKey($r.Id)) { $byId[$r.Id] = $r } }
+$i = 0
+$res = foreach ($c in $script:Checks) {
+    $i++
+    if ($byId.ContainsKey($c.Id)) { $byId[$c.Id]; continue }
+    $timedOut = $LbsTimedOut.ContainsKey($c.Id)
+    $msg = if ($timedOut) { "Skipped - did not finish within $LbsCheckLimit seconds when run as SYSTEM through Azure Run Command. Scan this host locally to get this result." }
+           else { "Not run - the remote scan used up its $LbsBudgetMinutes-minute time budget. Scan this host locally to get this result." }
+    $r = New-Result Error $msg
+    $r | Add-Member -NotePropertyMembers ([ordered]@{
+        Id = $c.Id; Category = $c.Category; Name = $c.Name; Weight = $c.Weight; Score = 0; Tags = @($c.Tags)
+        SortKey = '{0}{1:D2}{2:D3}' -f $StatusOrder['Error'], 99, $i; Ms = $(if ($timedOut) { $LbsCheckLimit * 1000 } else { 0 })
+    }) -Force
+    $r
+}
+$slow = @($res | Where-Object { $_.Ms -ge 3000 } | Sort-Object Ms -Descending | Select-Object -First 8 | ForEach-Object { '{0}:{1}' -f $_.Id, [int]($_.Ms / 1000) })
+$total = [int]$LbsWatch.Elapsed.TotalSeconds
+Write-LbsLog "Scan finished after $total s"
+
 function New-Compact([int]$Level) {
     $items = foreach ($r in $res) {
         $o = [ordered]@{ I = $r.Id; S = $r.Status; P = $r.Score; K = $r.SortKey }
@@ -3330,7 +3470,7 @@ function New-Compact([int]$Level) {
         if ($withText -contains $r.Status) { $t = [string]$r.Summary; if ($Level -ge 2 -and $t.Length -gt 140) { $t = $t.Substring(0, 137) + '...' }; $o.M = $t }
         $o
     }
-    $json = [ordered]@{ C = $E.ComputerName; F = $E.Family; B = $E.BuildString; R = $E.Roles; X = @($items) } | ConvertTo-Json -Depth 4 -Compress
+    $json = [ordered]@{ C = $E.ComputerName; F = $E.Family; B = $E.BuildString; R = $E.Roles; T = $total; W = $slow; X = @($items) } | ConvertTo-Json -Depth 4 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
     $ms = New-Object System.IO.MemoryStream
     $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
@@ -3340,9 +3480,17 @@ function New-Compact([int]$Level) {
 $line = New-Compact 0
 if ($line.Length -gt 3900) { $line = New-Compact 1 }
 if ($line.Length -gt 3900) { $line = New-Compact 2 }
-Write-Output $line
+if ($LbsAbandoned -eq 0) { Write-Output $line }
+else {
+    # A skipped check may still be busy: stop programs it started (only children of this scan process) and end
+    # the process, so the Run Command finishes now instead of waiting for it.
+    try { Get-CimInstance Win32_Process -Filter "ParentProcessId=$PID AND Name<>'conhost.exe'" -ErrorAction Stop | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue } } catch { }
+    [Console]::Out.WriteLine($line)
+    [Console]::Out.Flush()
+    [Environment]::Exit(0)
+}
 '@
-    "`$ErrorActionPreference = 'Continue'`r`n`$ProgressPreference = 'SilentlyContinue'`r`n`$LookbackDays = $Days`r`n$ki`r`n" + $EngineText + "`r`n" + $tail
+    $head + $tail
 }
 
 function ConvertFrom-RunCommandResult {
@@ -3360,48 +3508,75 @@ function ConvertFrom-RunCommandResult {
         $c = $byId[[string]$x.I]
         [pscustomobject]@{ Id = $x.I; Name = $(if ($c) { $c.Name } else { $x.I }); Category = $(if ($c) { $c.Category } else { '' }); Status = $x.S; Summary = [string]$x.M; Score = [int]$x.P; SortKey = $x.K }
     }
-    [pscustomobject]@{ Computer = $o.C; Env = [pscustomobject]@{ ComputerName = $o.C; Family = $o.F; BuildString = $o.B; Roles = "$($o.R) (scanned as SYSTEM via Azure Run Command)" }; Results = @($results) }
+    $slow = @(foreach ($w in @($o.W)) { if ("$w" -match '^(.+):(\d+)$') { [pscustomobject]@{ Id = $Matches[1]; Seconds = [int]$Matches[2] } } })
+    [pscustomobject]@{ Computer = $o.C; Env = [pscustomobject]@{ ComputerName = $o.C; Family = $o.F; BuildString = $o.B; Roles = "$($o.R) (scanned as SYSTEM via Azure Run Command)" }; Results = @($results)
+                       Duration = $(if ($null -ne $o.T) { [int]$o.T } else { $null }); Slow = $slow }
+}
+
+function Format-Duration {
+    param([double]$Seconds)
+    if ($Seconds -lt 60) { return '{0:N0} s' -f $Seconds }
+    $t = [TimeSpan]::FromSeconds([math]::Round($Seconds))
+    if ($t.TotalHours -ge 1) { return '{0}:{1:mm\:ss} h' -f [int][math]::Floor($t.TotalHours), $t }
+    '{0}:{1:ss} min' -f [int][math]::Floor($t.TotalMinutes), $t
 }
 
 function Invoke-FleetScanAzure {
-    param([Parameter(Mandatory)][string[]]$ComputerName, [string]$SubscriptionId, [int]$Days = $LookbackDays, [Parameter(Mandatory)][string]$EngineText, [string]$KnownIssuesText)
+    param([Parameter(Mandatory)][string[]]$ComputerName, [string]$SubscriptionId, [int]$Days = $LookbackDays, [Parameter(Mandatory)][string]$EngineText, [string]$KnownIssuesText, [string]$ProgressFile)
     Assert-ModuleAvailable 'Az.Accounts'; Assert-ModuleAvailable 'Az.Compute'
     $scriptFile = Join-Path $env:TEMP ('LBS-runcommand-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
     [System.IO.File]::WriteAllText($scriptFile, (New-RunCommandScanScript -EngineText $EngineText -Days $Days -KnownIssuesText $KnownIssuesText), (New-Object System.Text.UTF8Encoding $true))
-    $hostsB64 = ConvertTo-B64 (@($ComputerName) | ConvertTo-Json -Compress)
-    $code = (Get-AzPrelude -SubscriptionId $SubscriptionId) + @"
-
-Import-Module Az.Compute
-`$hosts = @([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$hostsB64')) | ConvertFrom-Json)
-Write-Host 'Finding the virtual machines...' -ForegroundColor Cyan
-`$vms = @(Get-AzVM)
-`$jobs = @(); `$out = @()
-foreach (`$h in `$hosts) {
-    `$short = (`$h -split '\.')[0]
-    `$vm = `$vms | Where-Object { `$_.Name -eq `$short -or `$_.Name -eq `$h -or `$_.OSProfile.ComputerName -eq `$short } | Select-Object -First 1
-    if (-not `$vm) { `$out += [pscustomobject]@{ Host = `$h; StdOut = ''; StdErr = ''; Error = "No VM named `$short found in subscription `$(`$ctx.Subscription.Name)." }; continue }
-    Write-Host "Starting the scan on `$(`$vm.Name) (`$(`$vm.ResourceGroupName))..."
-    `$j = Invoke-AzVMRunCommand -ResourceGroupName `$vm.ResourceGroupName -VMName `$vm.Name -CommandId 'RunPowerShellScript' -ScriptPath '$scriptFile' -AsJob
-    `$j | Add-Member -NotePropertyName ScanHost -NotePropertyValue `$h -Force
-    `$jobs += `$j
+    # Plain newline-separated list: ConvertFrom-Json in Windows PowerShell 5.1 returns a JSON array as ONE object
+    $hostsB64 = ConvertTo-B64 ((@($ComputerName) | ForEach-Object { "$_".Trim() } | Where-Object { $_ }) -join "`n")
+    $code = (Get-AzPrelude -SubscriptionId $SubscriptionId) + "`r`n" + @'
+$progressFile = '%PROGRESS%'
+function Write-Progress2([string]$Text, [string]$Color = 'Gray') {
+    Write-Host $Text -ForegroundColor $Color
+    if ($progressFile) { try { [System.IO.File]::WriteAllText($progressFile, $Text) } catch { } }
 }
-`$deadline = (Get-Date).AddMinutes(40)
-while (@(`$jobs | Where-Object { `$_.State -eq 'Running' -or `$_.State -eq 'NotStarted' }).Count -gt 0 -and (Get-Date) -lt `$deadline) {
-    `$doneCount = @(`$jobs | Where-Object { `$_.State -ne 'Running' -and `$_.State -ne 'NotStarted' }).Count
-    Write-Host ("{0:HH:mm:ss}  {1} of {2} host(s) finished - each scan takes about 1-3 minutes" -f (Get-Date), `$doneCount, `$jobs.Count)
+Import-Module Az.Compute
+$hosts = @([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%HOSTS%')) -split "`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+Write-Progress2 "Finding the virtual machines for $($hosts.Count) host(s)..." 'Cyan'
+$vms = @(Get-AzVM)
+$jobs = @(); $out = @()
+foreach ($h in $hosts) {
+    $short = ($h -split '\.')[0]
+    $vm = $vms | Where-Object { $_.Name -eq $short -or $_.Name -eq $h -or $_.OSProfile.ComputerName -eq $short } | Select-Object -First 1
+    if (-not $vm) {
+        Write-Host "No VM named $short in subscription $($ctx.Subscription.Name) - skipped." -ForegroundColor Yellow
+        $out += [pscustomobject]@{ Host = $h; StdOut = ''; StdErr = ''; Error = "No VM named $short found in subscription $($ctx.Subscription.Name)." }
+        continue
+    }
+    Write-Host "Starting the scan on $($vm.Name) ($($vm.ResourceGroupName))..."
+    try {
+        $j = Invoke-AzVMRunCommand -ResourceGroupName $vm.ResourceGroupName -VMName $vm.Name -CommandId 'RunPowerShellScript' -ScriptPath '%SCRIPT%' -AsJob -ErrorAction Stop
+        $j | Add-Member -NotePropertyName ScanHost -NotePropertyValue $h -Force
+        $j | Add-Member -NotePropertyName ScanName -NotePropertyValue $vm.Name -Force
+        $jobs += $j
+    } catch { $out += [pscustomobject]@{ Host = $h; StdOut = ''; StdErr = ''; Error = "Could not start the Run Command: $($_.Exception.Message)" } }
+}
+$start = Get-Date
+$deadline = $start.AddMinutes(40)
+$running = { @($jobs | Where-Object { $_.State -eq 'Running' -or $_.State -eq 'NotStarted' }) }
+while ((& $running).Count -gt 0 -and (Get-Date) -lt $deadline) {
+    $busy = & $running
+    $el = (Get-Date) - $start
+    Write-Progress2 ('{0:HH:mm:ss}  {1} of {2} host(s) finished after {3}:{4:ss} min - still running: {5}' -f (Get-Date), ($jobs.Count - $busy.Count), $jobs.Count, [int][math]::Floor($el.TotalMinutes), $el, (($busy | ForEach-Object { $_.ScanName }) -join ', '))
     Start-Sleep -Seconds 10
 }
-foreach (`$j in `$jobs) {
-    if (`$j.State -eq 'Running' -or `$j.State -eq 'NotStarted') { `$out += [pscustomobject]@{ Host = `$j.ScanHost; StdOut = ''; StdErr = ''; Error = 'Timed out after 40 minutes.' }; continue }
+foreach ($j in $jobs) {
+    if ($j.State -eq 'Running' -or $j.State -eq 'NotStarted') { $out += [pscustomobject]@{ Host = $j.ScanHost; StdOut = ''; StdErr = ''; Error = 'No result after 40 minutes. The Run Command may still be running on the VM (see C:\ProgramData\LogonBlackScreenAnalyzer\RunCommand.log there).' }; continue }
     try {
-        `$r = Receive-Job `$j -ErrorAction Stop
-        `$so = (@(`$r.Value) | Where-Object { `$_.Code -like '*StdOut*' } | ForEach-Object { `$_.Message }) -join "``n"
-        `$se = (@(`$r.Value) | Where-Object { `$_.Code -like '*StdErr*' } | ForEach-Object { `$_.Message }) -join "``n"
-        `$out += [pscustomobject]@{ Host = `$j.ScanHost; StdOut = `$so; StdErr = `$se; Error = `$null }
-    } catch { `$out += [pscustomobject]@{ Host = `$j.ScanHost; StdOut = ''; StdErr = ''; Error = `$_.Exception.Message } }
+        $r = Receive-Job $j -ErrorAction Stop
+        $so = (@($r.Value) | Where-Object { $_.Code -like '*StdOut*' } | ForEach-Object { $_.Message }) -join "`n"
+        $se = (@($r.Value) | Where-Object { $_.Code -like '*StdErr*' } | ForEach-Object { $_.Message }) -join "`n"
+        $out += [pscustomobject]@{ Host = $j.ScanHost; StdOut = $so; StdErr = $se; Error = $null }
+    } catch { $out += [pscustomobject]@{ Host = $j.ScanHost; StdOut = ''; StdErr = ''; Error = $_.Exception.Message } }
 }
-`$result = `$out
-"@
+Write-Progress2 "All hosts finished after $([int]((Get-Date) - $start).TotalMinutes) min - reading the results..." 'Cyan'
+$result = $out
+'@
+    $code = $code.Replace('%PROGRESS%', ($ProgressFile -replace "'", "''")).Replace('%HOSTS%', $hostsB64).Replace('%SCRIPT%', ($scriptFile -replace "'", "''"))
     try { $raw = @(Invoke-HelperProcess -Code $code -Title 'Fleet scan (Azure Run Command)' -TimeoutMinutes 45) }
     finally { Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue }
     $hosts = @(); $failed = @()
@@ -4386,7 +4561,7 @@ $MainXaml = @'
           <Border Grid.Row="0" Style="{StaticResource Card}" Padding="1"><DataGrid x:Name="GridFleet" AutoGenerateColumns="False" HorizontalScrollBarVisibility="Auto"/></Border>
           <Border Grid.Row="2" Style="{StaticResource Card}" Padding="1">
             <DockPanel>
-              <TextBlock x:Name="TxtFleetHost" DockPanel.Dock="Top" Text="Select a host to see its problems and warnings" Style="{StaticResource CardTitle}" Margin="14,10,14,6"/>
+              <TextBlock x:Name="TxtFleetHost" DockPanel.Dock="Top" Text="Select a host to see its problems and warnings" Style="{StaticResource CardTitle}" TextWrapping="Wrap" Margin="14,10,14,6"/>
               <DataGrid x:Name="GridFleetHost" AutoGenerateColumns="True"/>
             </DockPanel>
           </Border>
@@ -4828,7 +5003,10 @@ $script:JobTimer = New-Object System.Windows.Threading.DispatcherTimer
 $script:JobTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $script:JobTimer.Add_Tick({
     foreach ($j in @($script:Jobs)) {
-        if (-not $j.Handle.IsCompleted) { continue }
+        if (-not $j.Handle.IsCompleted) {
+            if ($j.OnTick -and ([datetime]::UtcNow - $j.LastTick).TotalSeconds -ge 1) { $j.LastTick = [datetime]::UtcNow; try { & $j.OnTick $j.State } catch { } }
+            continue
+        }
         $out = @(); $err = $null
         try { $out = @($j.Ps.EndInvoke($j.Handle)) }
         catch { $ex = $_.Exception; while ($ex.InnerException) { $ex = $ex.InnerException }; $err = $ex.Message }
@@ -4842,7 +5020,7 @@ $script:JobTimer.Add_Tick({
 })
 
 function Start-BgJob {
-    param([string]$Name, [string]$Script, [hashtable]$Vars = @{}, [scriptblock]$OnDone, $State)
+    param([string]$Name, [string]$Script, [hashtable]$Vars = @{}, [scriptblock]$OnDone, $State, [scriptblock]$OnTick)
     $rs = [runspacefactory]::CreateRunspace()
     $rs.ApartmentState = 'STA'
     $rs.Open()
@@ -4854,7 +5032,7 @@ function Start-BgJob {
     $ps = [powershell]::Create()
     $ps.Runspace = $rs
     [void]$ps.AddScript($script:CoreAll + "`n" + $Script)
-    $job = [pscustomobject]@{ Name = $Name; Ps = $ps; Handle = $null; OnDone = $OnDone; State = $State }
+    $job = [pscustomobject]@{ Name = $Name; Ps = $ps; Handle = $null; OnDone = $OnDone; State = $State; OnTick = $OnTick; LastTick = [datetime]::UtcNow }
     $job.Handle = $ps.BeginInvoke()
     [void]$script:Jobs.Add($job)
     Set-Busy "$Name..."
@@ -5543,10 +5721,17 @@ $ui.BtnFleetScan.Add_Click({
     $ki = ''; if ($KnownIssuesPath -and (Test-Path $KnownIssuesPath)) { $ki = [System.IO.File]::ReadAllText($KnownIssuesPath) }
     if ($ui.RbFleetAzure.IsChecked) {
         $ui.BtnFleetScan.IsEnabled = $false
-        $ui.TxtFleetInfo.Text = "Scanning $($hosts.Count) host(s) with Azure Run Command. Progress is shown in the separate PowerShell window (sign in there if Azure asks). Each host takes about 1-3 minutes; they run in parallel."
-        Start-BgJob -Name "Scanning $($hosts.Count) host(s) with Azure Run Command" -Script 'Invoke-FleetScanAzure -ComputerName $Hosts -SubscriptionId $Sub -Days $Days -EngineText $EngineText -KnownIssuesText $Ki' `
-            -Vars @{ Hosts = $hosts; Sub = (Get-ToolConfig).SubscriptionId; Days = $LookbackDays; EngineText = $script:EngineText; Ki = $ki } -OnDone {
-            param($out, $err)
+        $script:FleetIntro = "Scanning $($hosts.Count) host(s) with Azure Run Command in a separate PowerShell window (sign in there if Azure asks). The hosts run in parallel; a check that takes over 3 minutes is skipped and each scan stops after 20 minutes. Closing that window stops the waiting, not the scan on the VMs (it only reads, never changes anything)."
+        $ui.TxtFleetInfo.Text = $script:FleetIntro
+        $prog = Join-Path $env:TEMP ('LBS-progress-{0}.txt' -f [guid]::NewGuid().ToString('N'))
+        Start-BgJob -Name "Scanning $($hosts.Count) host(s) with Azure Run Command" -Script 'Invoke-FleetScanAzure -ComputerName $Hosts -SubscriptionId $Sub -Days $Days -EngineText $EngineText -KnownIssuesText $Ki -ProgressFile $Prog' `
+            -Vars @{ Hosts = $hosts; Sub = (Get-ToolConfig).SubscriptionId; Days = $LookbackDays; EngineText = $script:EngineText; Ki = $ki; Prog = $prog } -State $prog -OnTick {
+            param($prog)
+            $t = ''; try { if ([System.IO.File]::Exists($prog)) { $t = [System.IO.File]::ReadAllText($prog).Trim() } } catch { }
+            if ($t) { $ui.TxtFleetInfo.Text = "$t`r`n`r`n$script:FleetIntro" }
+        } -OnDone {
+            param($out, $err, $prog)
+            try { [System.IO.File]::Delete($prog) } catch { }
             $ui.BtnFleetScan.IsEnabled = $true
             if ($err) { $ui.TxtFleetInfo.Text = ''; Show-Error 'Fleet scan failed' $err; return }
             Show-Fleet ($out | Select-Object -Last 1)
@@ -5569,7 +5754,12 @@ $ui.BtnFleetScan.Add_Click({
 $ui.GridFleet.Add_SelectionChanged({
     $h = Get-GridSelection $ui.GridFleet
     if (-not $h) { return }
-    $ui.TxtFleetHost.Text = "$($h.Computer) - $($h.Env.Family) build $($h.Env.BuildString) - $($h.Env.Roles)"
+    $took = ''
+    if ($h.PSObject.Properties['Duration'] -and $null -ne $h.Duration) {
+        $took = " - scan took $(Format-Duration $h.Duration)"
+        if (@($h.Slow).Count) { $took += '; slowest checks: ' + ((@($h.Slow) | ForEach-Object { "$($_.Id) $(Format-Duration $_.Seconds)" }) -join ', ') }
+    }
+    $ui.TxtFleetHost.Text = "$($h.Computer) - $($h.Env.Family) build $($h.Env.BuildString) - $($h.Env.Roles)$took"
     $items = @($h.Results | Where-Object { $_.Status -in 'Problem', 'Warning', 'Error' } | Sort-Object SortKey)
     $rows = foreach ($r in $items) { [ordered]@{ 'Status' = $r.Status; 'Check' = "$($r.Id) $($r.Name)"; 'Result' = $r.Summary } }
     Set-GridData $ui.GridFleetHost @($rows) $items
