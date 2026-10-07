@@ -942,9 +942,16 @@ Register-Check -Id 'CFG-06' -Category 'Logon configuration' -Weight 1 -Tags 'Ima
     -Name 'Machine Run / RunOnce entries' `
     -Test {
         param($E)
-        $runOnce = @(); $run = @()
+        $runOnce = @(); $run = @(); $edgeRo = @()
         foreach ($p in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce') {
-            if (Test-Path $p) { $k = Get-Item $p; foreach ($n in $k.GetValueNames()) { $runOnce += "$n = $($k.GetValue($n))" } }
+            if (Test-Path $p) {
+                $k = Get-Item $p
+                foreach ($n in $k.GetValueNames()) {
+                    $v = [string]$k.GetValue($n)
+                    $runOnce += "$n = $v"
+                    if ($n -like 'msedge_cleanup_*' -or $v -match 'delete-old-versions') { $edgeRo += [pscustomobject]@{ Key = $p; Name = $n; Value = $v } }
+                }
+            }
         }
         foreach ($p in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run') {
             if (Test-Path $p) { $k = Get-Item $p; foreach ($n in $k.GetValueNames()) { $run += "$n = $($k.GetValue($n))" } }
@@ -976,17 +983,48 @@ if ($p.ExitCode -notin 0, 3010) { throw "msiexec returned exit code $($p.ExitCod
                 -Changes 'Runs msiexec /x <product code> /qn for "Teams Machine-Wide Installer". New Teams and per-user installs are not touched.'
             return New-Result Warning 'Classic "Teams Machine-Wide Installer" runs at every logon and installs Teams per user (very slow on non-persistent profiles).' $detail $fix $cmd -Impact $impact -AutoFix $auto
         }
-        if ($runOnce) {
+        $otherRo = @($runOnce | Where-Object { $line = $_; -not @($edgeRo | Where-Object { $line -eq "$($_.Name) = $($_.Value)" }) })
+        if ($otherRo) {
             $fix = Format-Steps @(
                 'Review each RunOnce entry in the evidence.'
                 'If it belongs to an installer or update that has not finished: sign in once as an administrator (console/RDP) so it completes, or run the command manually elevated.'
                 'If it is a leftover: export the RunOnce key and delete the value.'
+                $(if ($edgeRo) { 'Edge / WebView2 "msedge_cleanup_..." entries are update cleanups - see the note in the evidence; they can be run right away.' })
             )
             $impact = Format-Bullets @(
                 'Deleting an entry for an unfinished installation can leave that product half-configured - check what the command does first.'
                 'No reboot and no visible change for users.'
             )
-            return New-Result Warning "$($runOnce.Count) HKLM RunOnce entr(y/ies) present - they run during logon and are only cleared by an administrator logon, so they can linger." $detail $fix -Impact $impact
+            return New-Result Warning "$($otherRo.Count) HKLM RunOnce entr(y/ies) present - Windows only processes them when an administrator signs in, so they can linger." $detail $fix -Impact $impact
+        }
+        if ($edgeRo) {
+            $fix = Format-Steps @(
+                'Run the cleanup now with the one-click fix (or the command below, elevated). It removes the old Edge / WebView2 versions and the RunOnce entry.'
+                'Edge / WebView2 adds a new entry after updates while old files were in use - rebooting the session hosts regularly (e.g. after patching) lets it finish without an admin sign-in.'
+            )
+            $impact = Format-Bullets @(
+                'Only removes old, unused Edge / WebView2 versions (frees disk space). Users notice nothing.'
+                'Takes a few minutes; no reboot.'
+                'Without it, the cleanup waits until an administrator signs in - and then delays that admin sign-in by a few minutes.'
+            )
+            $list = ($edgeRo | ForEach-Object { "    @{ Key = '$($_.Key)'; Name = '$($_.Name -replace "'", "''")' }" }) -join "`r`n"
+            $cmd = @"
+# Edge / WebView2 update cleanup from HKLM RunOnce - runs it now and removes the entry (Windows also removes RunOnce values before running them)
+`$entries = @(
+$list
+)
+foreach (`$e in `$entries) {
+    `$v = (Get-ItemProperty -Path `$e.Key -Name `$e.Name -ErrorAction SilentlyContinue).(`$e.Name)
+    if (-not `$v) { "`$(`$e.Name) is already gone."; continue }
+    Remove-ItemProperty -Path `$e.Key -Name `$e.Name
+    `$p = Start-Process -FilePath "`$env:SystemRoot\System32\cmd.exe" -ArgumentList ('/s /c "' + `$v + '"') -Wait -PassThru -WindowStyle Hidden
+    "Ran `$(`$e.Name) (exit code `$(`$p.ExitCode))"
+}
+"@
+            $auto = New-AutoFix -Label 'Run the Edge / WebView2 cleanup now' `
+                -Changes "Removes the $($edgeRo.Count) msedge_cleanup RunOnce entr$(if ($edgeRo.Count -eq 1) { 'y' } else { 'ies' }) and runs the Edge / WebView2 setup.exe cleanup (--delete-old-versions) once, hidden. Takes a few minutes."
+            $note = "`r`n`r`nNote: msedge_cleanup entries are Edge / WebView2 update cleanups. Windows only runs machine-wide RunOnce entries when an administrator signs in, so normal users are not delayed by them."
+            return New-Result Info "Edge / WebView2 update cleanup is waiting in RunOnce - it only runs when an administrator signs in (and then takes a few minutes). It does not delay normal users." ($detail + $note) $fix $cmd -Impact $impact -AutoFix $auto
         }
         New-Result Info "$($run.Count) HKLM Run entries, no RunOnce entries." $detail `
             'Only if a Run entry is slow (see TIM-04): remove it, or start it delayed through a scheduled task.' `
