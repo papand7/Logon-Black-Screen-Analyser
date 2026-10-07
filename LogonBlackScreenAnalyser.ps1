@@ -14,6 +14,8 @@
       -NoGui                          Scan and print the results (read-only). Add -ReportPath / -JsonPath to save them.
       -Gate [-GateLevel Problem|Warning] [-JsonPath f]
                                       Golden image gate: image-related checks only. Exit code 0 = pass, 1 = fail, 2 = error.
+      -ComputerName a,b,c -AzureRunCommand [-ReportPath f]
+                                      Fleet scan through Azure Run Command (no WinRM needed; Az.Compute, VM Contributor).
       -ComputerName a,b,c [-Credential c] [-ReportPath f]
                                       Fleet scan over PowerShell remoting (WinRM, admin rights on the hosts).
       -SaveBaseline <file> / -CompareBaseline <file>
@@ -83,6 +85,7 @@ param(
     [switch]$InstallProbe,
     [switch]$UninstallProbe,
     [switch]$InstallModules,
+    [switch]$AzureRunCommand,
     [string]$SharePath,
     [switch]$ReportShortcut,
     [string]$KnownIssuesPath
@@ -1018,7 +1021,13 @@ foreach (`$e in `$entries) {
     if (-not `$v) { "`$(`$e.Name) is already gone."; continue }
     Remove-ItemProperty -Path `$e.Key -Name `$e.Name
     `$p = Start-Process -FilePath "`$env:SystemRoot\System32\cmd.exe" -ArgumentList ('/s /c "' + `$v + '"') -Wait -PassThru -WindowStyle Hidden
-    "Ran `$(`$e.Name) (exit code `$(`$p.ExitCode))"
+    # Chromium installer status codes (Edge / WebView2 use the same): 61 = old versions deleted, 62 = gave up after too many attempts
+    `$meaning = switch (`$p.ExitCode) {
+        61 { 'old versions deleted' }
+        62 { 'gave up after too many attempts - old version files are probably still in use (msedgewebview2.exe in user sessions). Reboot the host; the old version folders under EdgeWebView\Application can then be deleted, or are removed with the next WebView2 update. Users are not affected.' }
+        default { '' }
+    }
+    "Ran `$(`$e.Name) (exit code `$(`$p.ExitCode)`$(if (`$meaning) { ': ' + `$meaning }))"
 }
 "@
             $auto = New-AutoFix -Label 'Run the Edge / WebView2 cleanup now' `
@@ -2574,6 +2583,7 @@ $RequiredModules = @(
     [pscustomobject]@{ Name = 'Az.Accounts';                    Purpose = 'Azure sign-in (AVD Insights, host pool list)' }
     [pscustomobject]@{ Name = 'Az.OperationalInsights';         Purpose = 'AVD Insights queries (Log Analytics)' }
     [pscustomobject]@{ Name = 'Az.DesktopVirtualization';       Purpose = 'Load session hosts from an AVD host pool (Fleet tab)' }
+    [pscustomobject]@{ Name = 'Az.Compute';                     Purpose = 'Fleet scan with Azure Run Command' }
     [pscustomobject]@{ Name = 'Microsoft.Graph.Authentication'; Purpose = 'Windows release health known issues (Microsoft Graph)' }
 )
 
@@ -3300,6 +3310,115 @@ Write-Host 'Loading session hosts of host pool $($HostPool -replace "'", '')...'
 `$result = @(Get-AzWvdSessionHost -ResourceGroupName `$rg -HostPoolName `$hp | ForEach-Object { (`$_.Name -split '/')[-1] })
 "@
     foreach ($n in (Invoke-HelperProcess -Code $code -Title 'AVD host pool')) { if ($n) { [string]$n } }
+}
+
+# Fleet scan through Azure Run Command: no WinRM / Kerberos needed, runs as SYSTEM on each VM via the VM agent.
+# Run Command returns only the last 4,096 bytes of output, so each VM sends back a gzip+base64 compact result
+# (status per check + summaries of the findings); names and categories come from the local check list.
+function New-RunCommandScanScript {
+    param([Parameter(Mandatory)][string]$EngineText, [int]$Days = 7, [string]$KnownIssuesText)
+    $ki = ''
+    if ($KnownIssuesText) { $ki = "`$KnownIssuesJson = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(ConvertTo-B64 $KnownIssuesText)'))" }
+    $tail = @'
+
+$E = Get-HostEnvironment
+$res = @(Invoke-AllChecks -E $E)
+function New-Compact([int]$Level) {
+    $items = foreach ($r in $res) {
+        $o = [ordered]@{ I = $r.Id; S = $r.Status; P = $r.Score; K = $r.SortKey }
+        $withText = if ($Level -eq 0) { 'Problem', 'Warning', 'Error', 'Info' } else { 'Problem', 'Warning', 'Error' }
+        if ($withText -contains $r.Status) { $t = [string]$r.Summary; if ($Level -ge 2 -and $t.Length -gt 140) { $t = $t.Substring(0, 137) + '...' }; $o.M = $t }
+        $o
+    }
+    $json = [ordered]@{ C = $E.ComputerName; F = $E.Family; B = $E.BuildString; R = $E.Roles; X = @($items) } | ConvertTo-Json -Depth 4 -Compress
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    $ms = New-Object System.IO.MemoryStream
+    $gz = New-Object System.IO.Compression.GZipStream($ms, [System.IO.Compression.CompressionMode]::Compress)
+    $gz.Write($bytes, 0, $bytes.Length); $gz.Close()
+    'LBS1:' + [Convert]::ToBase64String($ms.ToArray())
+}
+$line = New-Compact 0
+if ($line.Length -gt 3900) { $line = New-Compact 1 }
+if ($line.Length -gt 3900) { $line = New-Compact 2 }
+Write-Output $line
+'@
+    "`$ErrorActionPreference = 'Continue'`r`n`$ProgressPreference = 'SilentlyContinue'`r`n`$LookbackDays = $Days`r`n$ki`r`n" + $EngineText + "`r`n" + $tail
+}
+
+function ConvertFrom-RunCommandResult {
+    param([string]$StdOut)
+    $line = @($StdOut -split "`r?`n" | Where-Object { $_ -like 'LBS1:*' }) | Select-Object -Last 1
+    if (-not $line) { return $null }
+    $bytes = [Convert]::FromBase64String($line.Substring(5).Trim())
+    $in = New-Object System.IO.MemoryStream (, $bytes)
+    $gz = New-Object System.IO.Compression.GZipStream($in, [System.IO.Compression.CompressionMode]::Decompress)
+    $reader = New-Object System.IO.StreamReader($gz, [System.Text.Encoding]::UTF8)
+    $o = $reader.ReadToEnd() | ConvertFrom-Json
+    $reader.Close()
+    $byId = @{}; foreach ($c in $script:Checks) { $byId[$c.Id] = $c }
+    $results = foreach ($x in @($o.X)) {
+        $c = $byId[[string]$x.I]
+        [pscustomobject]@{ Id = $x.I; Name = $(if ($c) { $c.Name } else { $x.I }); Category = $(if ($c) { $c.Category } else { '' }); Status = $x.S; Summary = [string]$x.M; Score = [int]$x.P; SortKey = $x.K }
+    }
+    [pscustomobject]@{ Computer = $o.C; Env = [pscustomobject]@{ ComputerName = $o.C; Family = $o.F; BuildString = $o.B; Roles = "$($o.R) (scanned as SYSTEM via Azure Run Command)" }; Results = @($results) }
+}
+
+function Invoke-FleetScanAzure {
+    param([Parameter(Mandatory)][string[]]$ComputerName, [string]$SubscriptionId, [int]$Days = $LookbackDays, [Parameter(Mandatory)][string]$EngineText, [string]$KnownIssuesText)
+    Assert-ModuleAvailable 'Az.Accounts'; Assert-ModuleAvailable 'Az.Compute'
+    $scriptFile = Join-Path $env:TEMP ('LBS-runcommand-{0}.ps1' -f [guid]::NewGuid().ToString('N'))
+    [System.IO.File]::WriteAllText($scriptFile, (New-RunCommandScanScript -EngineText $EngineText -Days $Days -KnownIssuesText $KnownIssuesText), (New-Object System.Text.UTF8Encoding $true))
+    $hostsB64 = ConvertTo-B64 (@($ComputerName) | ConvertTo-Json -Compress)
+    $code = (Get-AzPrelude -SubscriptionId $SubscriptionId) + @"
+
+Import-Module Az.Compute
+`$hosts = @([System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$hostsB64')) | ConvertFrom-Json)
+Write-Host 'Finding the virtual machines...' -ForegroundColor Cyan
+`$vms = @(Get-AzVM)
+`$jobs = @(); `$out = @()
+foreach (`$h in `$hosts) {
+    `$short = (`$h -split '\.')[0]
+    `$vm = `$vms | Where-Object { `$_.Name -eq `$short -or `$_.Name -eq `$h -or `$_.OSProfile.ComputerName -eq `$short } | Select-Object -First 1
+    if (-not `$vm) { `$out += [pscustomobject]@{ Host = `$h; StdOut = ''; StdErr = ''; Error = "No VM named `$short found in subscription `$(`$ctx.Subscription.Name)." }; continue }
+    Write-Host "Starting the scan on `$(`$vm.Name) (`$(`$vm.ResourceGroupName))..."
+    `$j = Invoke-AzVMRunCommand -ResourceGroupName `$vm.ResourceGroupName -VMName `$vm.Name -CommandId 'RunPowerShellScript' -ScriptPath '$scriptFile' -AsJob
+    `$j | Add-Member -NotePropertyName ScanHost -NotePropertyValue `$h -Force
+    `$jobs += `$j
+}
+`$deadline = (Get-Date).AddMinutes(40)
+while (@(`$jobs | Where-Object { `$_.State -eq 'Running' -or `$_.State -eq 'NotStarted' }).Count -gt 0 -and (Get-Date) -lt `$deadline) {
+    `$doneCount = @(`$jobs | Where-Object { `$_.State -ne 'Running' -and `$_.State -ne 'NotStarted' }).Count
+    Write-Host ("{0:HH:mm:ss}  {1} of {2} host(s) finished - each scan takes about 1-3 minutes" -f (Get-Date), `$doneCount, `$jobs.Count)
+    Start-Sleep -Seconds 10
+}
+foreach (`$j in `$jobs) {
+    if (`$j.State -eq 'Running' -or `$j.State -eq 'NotStarted') { `$out += [pscustomobject]@{ Host = `$j.ScanHost; StdOut = ''; StdErr = ''; Error = 'Timed out after 40 minutes.' }; continue }
+    try {
+        `$r = Receive-Job `$j -ErrorAction Stop
+        `$so = (@(`$r.Value) | Where-Object { `$_.Code -like '*StdOut*' } | ForEach-Object { `$_.Message }) -join "``n"
+        `$se = (@(`$r.Value) | Where-Object { `$_.Code -like '*StdErr*' } | ForEach-Object { `$_.Message }) -join "``n"
+        `$out += [pscustomobject]@{ Host = `$j.ScanHost; StdOut = `$so; StdErr = `$se; Error = `$null }
+    } catch { `$out += [pscustomobject]@{ Host = `$j.ScanHost; StdOut = ''; StdErr = ''; Error = `$_.Exception.Message } }
+}
+`$result = `$out
+"@
+    try { $raw = @(Invoke-HelperProcess -Code $code -Title 'Fleet scan (Azure Run Command)' -TimeoutMinutes 45) }
+    finally { Remove-Item $scriptFile -Force -ErrorAction SilentlyContinue }
+    $hosts = @(); $failed = @()
+    foreach ($r in $raw) {
+        if (-not $r) { continue }
+        if ($r.Error) { $failed += [pscustomobject]@{ Computer = $r.Host; Error = $r.Error }; continue }
+        $h = $null
+        try { $h = ConvertFrom-RunCommandResult -StdOut $r.StdOut } catch { }
+        if ($h) { $hosts += $h }
+        else {
+            $msg = "The scan returned no result."
+            if ($r.StdErr) { $msg += ' Errors: ' + (([string]$r.StdErr) -replace '\s+', ' ').Trim() }
+            if ($msg.Length -gt 600) { $msg = $msg.Substring(0, 600) + '...' }
+            $failed += [pscustomobject]@{ Computer = $r.Host; Error = $msg }
+        }
+    }
+    [pscustomobject]@{ Hosts = $hosts; Failed = $failed; Time = Get-Date }
 }
 
 # Connections of one user plus all their checkpoints / errors, in one helper run
@@ -4242,16 +4361,25 @@ $MainXaml = @'
       <Grid x:Name="PageFleet" Visibility="Collapsed">
         <Grid.ColumnDefinitions><ColumnDefinition Width="320"/><ColumnDefinition Width="16"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
         <Border Grid.Column="0" Style="{StaticResource Card}" Padding="18,14">
+          <ScrollViewer VerticalScrollBarVisibility="Auto">
           <StackPanel>
             <TextBlock Text="Session hosts" Style="{StaticResource CardTitle}"/>
-            <TextBlock Text="One host name per line. The scan runs remotely over WinRM (PowerShell remoting) with administrator rights." Style="{StaticResource Hint}" Margin="0,4,0,8"/>
-            <TextBox x:Name="TxtFleetHosts" Style="{StaticResource Input}" AcceptsReturn="True" Height="220" VerticalContentAlignment="Top" VerticalScrollBarVisibility="Auto"/>
+            <TextBlock Text="One host name per line (VM name or FQDN)." Style="{StaticResource Hint}" Margin="0,4,0,8"/>
+            <TextBox x:Name="TxtFleetHosts" Style="{StaticResource Input}" AcceptsReturn="True" Height="180" VerticalContentAlignment="Top" VerticalScrollBarVisibility="Auto"/>
             <Button x:Name="BtnFleetPool" Style="{StaticResource BtnSecondary}" Content="Load from AVD host pool" Margin="0,10,0,0" HorizontalAlignment="Stretch"/>
-            <CheckBox x:Name="ChkFleetCred" Content="Use other credentials" Margin="0,12,0,0" Foreground="#344054"/>
-            <Button x:Name="BtnFleetScan" Style="{StaticResource BtnPrimary}" Content="Scan hosts" Margin="0,12,0,0" HorizontalAlignment="Stretch"/>
+            <TextBlock Text="CONNECT WITH" Style="{StaticResource Lbl}" Margin="0,14,0,4"/>
+            <RadioButton x:Name="RbFleetAzure" GroupName="FleetMode" IsChecked="True" Foreground="#344054" Margin="0,2,0,0">
+              <TextBlock TextWrapping="Wrap" Text="Azure Run Command (recommended for AVD) - no WinRM / Kerberos needed; runs as SYSTEM on each VM. Needs Virtual Machine Contributor on the VMs and the Az.Compute module."/>
+            </RadioButton>
+            <RadioButton x:Name="RbFleetWinRM" GroupName="FleetMode" Foreground="#344054" Margin="0,8,0,0">
+              <TextBlock TextWrapping="Wrap" Text="WinRM (PowerShell remoting) - needs domain / Kerberos access and administrator rights on the hosts."/>
+            </RadioButton>
+            <CheckBox x:Name="ChkFleetCred" Content="Use other credentials (WinRM)" Margin="20,6,0,0" Foreground="#344054" IsEnabled="False"/>
+            <Button x:Name="BtnFleetScan" Style="{StaticResource BtnPrimary}" Content="Scan hosts" Margin="0,14,0,0" HorizontalAlignment="Stretch"/>
             <Button x:Name="BtnFleetExport" Style="{StaticResource BtnSecondary}" Content="Export fleet report" Margin="0,8,0,0" HorizontalAlignment="Stretch" IsEnabled="False"/>
-            <TextBlock x:Name="TxtFleetInfo" Style="{StaticResource Hint}" Margin="0,12,0,0"/>
+            <TextBox x:Name="TxtFleetInfo" Style="{StaticResource Ro}" FontSize="12" Foreground="#667085" Margin="0,12,0,0"/>
           </StackPanel>
+          </ScrollViewer>
         </Border>
         <Grid Grid.Column="2">
           <Grid.RowDefinitions><RowDefinition Height="*"/><RowDefinition Height="14"/><RowDefinition Height="240"/></Grid.RowDefinitions>
@@ -5407,12 +5535,27 @@ $ui.BtnFleetPool.Add_Click({
         Clear-Busy "$($names.Count) session host(s) loaded"
     }
 })
+$ui.RbFleetAzure.Add_Checked({ $ui.ChkFleetCred.IsEnabled = $false })
+$ui.RbFleetWinRM.Add_Checked({ $ui.ChkFleetCred.IsEnabled = $true })
 $ui.BtnFleetScan.Add_Click({
     $hosts = @($ui.TxtFleetHosts.Text -split "[`r`n,;]+" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     if (-not $hosts) { [void](Show-Dialog -Title 'No hosts' -Message 'Enter at least one host name, or load them from the AVD host pool.' -Kind Warning); return }
+    $ki = ''; if ($KnownIssuesPath -and (Test-Path $KnownIssuesPath)) { $ki = [System.IO.File]::ReadAllText($KnownIssuesPath) }
+    if ($ui.RbFleetAzure.IsChecked) {
+        $ui.BtnFleetScan.IsEnabled = $false
+        $ui.TxtFleetInfo.Text = "Scanning $($hosts.Count) host(s) with Azure Run Command. Progress is shown in the separate PowerShell window (sign in there if Azure asks). Each host takes about 1-3 minutes; they run in parallel."
+        Start-BgJob -Name "Scanning $($hosts.Count) host(s) with Azure Run Command" -Script 'Invoke-FleetScanAzure -ComputerName $Hosts -SubscriptionId $Sub -Days $Days -EngineText $EngineText -KnownIssuesText $Ki' `
+            -Vars @{ Hosts = $hosts; Sub = (Get-ToolConfig).SubscriptionId; Days = $LookbackDays; EngineText = $script:EngineText; Ki = $ki } -OnDone {
+            param($out, $err)
+            $ui.BtnFleetScan.IsEnabled = $true
+            if ($err) { $ui.TxtFleetInfo.Text = ''; Show-Error 'Fleet scan failed' $err; return }
+            Show-Fleet ($out | Select-Object -Last 1)
+            Clear-Busy 'Fleet scan finished'
+        }
+        return
+    }
     $cred = $null
     if ($ui.ChkFleetCred.IsChecked) { $cred = Get-Credential -Message 'Account with administrator rights on the session hosts'; if (-not $cred) { return } }
-    $ki = ''; if ($KnownIssuesPath -and (Test-Path $KnownIssuesPath)) { $ki = [System.IO.File]::ReadAllText($KnownIssuesPath) }
     $ui.BtnFleetScan.IsEnabled = $false
     Start-BgJob -Name "Scanning $($hosts.Count) host(s)" -Script 'Invoke-FleetScan -ComputerName $Hosts -Credential $Cred -Days $Days -CoreText $EngineText -KnownIssuesText $Ki' `
         -Vars @{ Hosts = $hosts; Cred = $cred; Days = $LookbackDays; EngineText = $script:EngineText; Ki = $ki } -OnDone {
@@ -5788,7 +5931,8 @@ if ($ComputerName) {
     $hosts = @($ComputerName | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     $ki = ''; if (Test-Path $KnownIssuesPath) { $ki = [System.IO.File]::ReadAllText($KnownIssuesPath) }
     Write-Host "Scanning $($hosts.Count) host(s) over PowerShell remoting..." -ForegroundColor Cyan
-    $fleet = Invoke-FleetScan -ComputerName $hosts -Credential $Credential -Days $LookbackDays -CoreText $script:EngineText -KnownIssuesText $ki
+    if ($AzureRunCommand) { $fleet = Invoke-FleetScanAzure -ComputerName $hosts -SubscriptionId (Get-ToolConfig).SubscriptionId -Days $LookbackDays -EngineText $script:EngineText -KnownIssuesText $ki }
+    else { $fleet = Invoke-FleetScan -ComputerName $hosts -Credential $Credential -Days $LookbackDays -CoreText $script:EngineText -KnownIssuesText $ki }
     $fleet.Hosts | Sort-Object Computer | ForEach-Object {
         $top = Get-TopCauses $_.Results 1
         [pscustomobject]@{ Host = $_.Computer; Build = $_.Env.BuildString; Problems = @($_.Results | Where-Object Status -eq 'Problem').Count; Warnings = @($_.Results | Where-Object Status -eq 'Warning').Count; 'Most likely cause' = $(if ($top) { "$($top.Id) $($top.Summary)" }) }
